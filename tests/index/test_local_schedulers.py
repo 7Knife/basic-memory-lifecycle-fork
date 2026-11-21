@@ -1,0 +1,638 @@
+"""Typed scheduler tests for derived async work."""
+
+import asyncio
+from typing import cast, override
+
+import pytest
+
+from basic_memory.indexing.project_index_coordinator import ProjectIndexCoordinatorResult
+from basic_memory.indexing.relation_resolution import RepositoryRelationResolutionRuntime
+from basic_memory.index.local_schedulers import (
+    LocalEntityVectorSyncScheduler,
+    LocalProjectIndexScheduler,
+    LocalRelationResolutionScheduler,
+    LocalSearchReindexScheduler,
+    drain_background_tasks,
+)
+from basic_memory.read_cache import ReadCacheChange, ReadCacheInvalidationStatus
+from basic_memory.repository.note_content_repository import NoteContentRepository
+from basic_memory.repository.semantic_chunking import compose_row_source_text
+from basic_memory.runtime.vector_sync import VectorSyncBatchResult
+from basic_memory.schemas.base import Entity as EntitySchema
+from basic_memory.schemas.search import SearchItemType
+from basic_memory.services.bulk_link_resolver import BulkLinkResolver
+
+PROJECT_EXTERNAL_ID = "00000000-0000-0000-0000-000000000013"
+
+
+class StubProjectIndexRunner:
+    def __init__(self) -> None:
+        self.indexed: list[tuple[int, bool]] = []
+
+    async def index_project(
+        self,
+        project_id: int,
+        *,
+        force_full: bool = False,
+    ) -> ProjectIndexCoordinatorResult:
+        self.indexed.append((project_id, force_full))
+        return cast(ProjectIndexCoordinatorResult, object())
+
+
+class StubSearchService:
+    def __init__(self) -> None:
+        self.vector_synced: list[int] = []
+        self.reindexed_project = False
+
+    async def sync_entity_vectors(self, entity_id: int) -> VectorSyncBatchResult:
+        self.vector_synced.append(entity_id)
+        return VectorSyncBatchResult(entities_total=1, entities_synced=1, entities_failed=0)
+
+    async def reindex_all(self) -> None:
+        self.reindexed_project = True
+
+
+class RecordingReadCache:
+    """Records every invalidation, scoped or whole-project, in call order."""
+
+    def __init__(self) -> None:
+        self.invalidated_project_ids: list[str] = []
+        self.changes: list[ReadCacheChange] = []
+
+    async def invalidate(
+        self,
+        project_id: str,
+        change: ReadCacheChange,
+    ) -> ReadCacheInvalidationStatus:
+        self.invalidated_project_ids.append(project_id)
+        self.changes.append(change)
+        return ReadCacheInvalidationStatus.invalidated
+
+    async def invalidate_project(self, project_id: str) -> ReadCacheInvalidationStatus:
+        return await self.invalidate(project_id, ReadCacheChange.whole_project())
+
+
+@pytest.mark.asyncio
+async def test_entity_vector_scheduler_maps_to_search_service():
+    """Entity vector scheduling should call the semantic vector sync method."""
+    search_service = StubSearchService()
+    read_cache = RecordingReadCache()
+
+    scheduler = LocalEntityVectorSyncScheduler(
+        search_service=search_service,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+    )
+    scheduler.schedule_entity_vector_sync(entity_id=7, project_id=13)
+    await drain_background_tasks()
+
+    assert search_service.vector_synced == [7]
+    # Vectors change search results only, never a note's own response.
+    assert read_cache.changes == [ReadCacheChange.search_index()]
+
+
+@pytest.mark.asyncio
+async def test_entity_vector_scheduler_invalidates_after_partial_failure():
+    """A failed vector publication may still have changed derived search state."""
+
+    class FailingSearchService(StubSearchService):
+        @override
+        async def sync_entity_vectors(self, entity_id: int) -> VectorSyncBatchResult:
+            self.vector_synced.append(entity_id)
+            raise RuntimeError("vector publication failed")
+
+    search_service = FailingSearchService()
+    read_cache = RecordingReadCache()
+    scheduler = LocalEntityVectorSyncScheduler(
+        search_service=search_service,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+    )
+
+    with pytest.raises(RuntimeError, match="vector publication failed"):
+        await scheduler._run_entity_vector_sync(7)
+
+    assert read_cache.changes == [ReadCacheChange.whole_project()]
+
+
+def _clear_project_index_scheduler_state() -> None:
+    from basic_memory.index.local_schedulers import _dirty_project_index, _pending_project_index
+
+    _pending_project_index.clear()
+    _dirty_project_index.clear()
+
+
+@pytest.mark.asyncio
+async def test_project_index_scheduler_maps_to_project_index_runner():
+    """Project index scheduling should call the event-index project runner."""
+    _clear_project_index_scheduler_state()
+    project_index_runner = StubProjectIndexRunner()
+
+    scheduler = LocalProjectIndexScheduler(
+        project_index_runner=project_index_runner,
+        test_mode=False,
+    )
+    scheduler.schedule_project_index(project_id=13, force_full=True)
+    await drain_background_tasks()
+
+    assert project_index_runner.indexed == [(13, True)]
+
+
+class GatedProjectIndexRunner:
+    """Runner whose first run blocks until released, to hold a run in flight."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool]] = []
+        self.first_run_started = asyncio.Event()
+        self.release_first_run = asyncio.Event()
+
+    async def index_project(
+        self,
+        project_id: int,
+        *,
+        force_full: bool = False,
+    ) -> ProjectIndexCoordinatorResult:
+        self.calls.append((project_id, force_full))
+        if len(self.calls) == 1:
+            self.first_run_started.set()
+            await self.release_first_run.wait()
+        return cast(ProjectIndexCoordinatorResult, object())
+
+
+@pytest.mark.asyncio
+async def test_project_index_scheduler_coalesces_requests_during_in_flight_run():
+    """While a run is in flight, new requests must not start a second concurrent
+    run over the same rows; they coalesce to exactly one trailing rerun that
+    keeps the strongest force_full seen."""
+    from basic_memory.index.local_schedulers import _dirty_project_index, _pending_project_index
+
+    _clear_project_index_scheduler_state()
+    runner = GatedProjectIndexRunner()
+    scheduler = LocalProjectIndexScheduler(project_index_runner=runner, test_mode=False)
+
+    scheduler.schedule_project_index(project_id=13)
+    await asyncio.wait_for(runner.first_run_started.wait(), timeout=1)
+
+    # A burst of requests lands while the first run is still scanning.
+    scheduler.schedule_project_index(project_id=13)
+    scheduler.schedule_project_index(project_id=13, force_full=True)
+    scheduler.schedule_project_index(project_id=13)
+    assert runner.calls == [(13, False)]
+
+    runner.release_first_run.set()
+    await drain_background_tasks()
+
+    assert runner.calls == [(13, False), (13, True)]
+    assert 13 not in _pending_project_index
+    assert 13 not in _dirty_project_index
+
+
+class FailingThenGatedProjectIndexRunner:
+    """Runner whose first run blocks until released, then raises."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool]] = []
+        self.first_run_started = asyncio.Event()
+        self.release_first_run = asyncio.Event()
+
+    async def index_project(
+        self,
+        project_id: int,
+        *,
+        force_full: bool = False,
+    ) -> ProjectIndexCoordinatorResult:
+        self.calls.append((project_id, force_full))
+        if len(self.calls) == 1:
+            self.first_run_started.set()
+            await self.release_first_run.wait()
+            raise RuntimeError("scan blew up mid-run")
+        return cast(ProjectIndexCoordinatorResult, object())
+
+
+@pytest.mark.asyncio
+async def test_project_index_scheduler_reruns_coalesced_request_after_failed_run():
+    """A request coalesced behind a run that raises must still get its rerun —
+    a failed run is exactly when the coalesced request most needs its retry."""
+    from basic_memory.index.local_schedulers import _dirty_project_index, _pending_project_index
+
+    _clear_project_index_scheduler_state()
+    runner = FailingThenGatedProjectIndexRunner()
+    scheduler = LocalProjectIndexScheduler(project_index_runner=runner, test_mode=False)
+
+    scheduler.schedule_project_index(project_id=13)
+    await asyncio.wait_for(runner.first_run_started.wait(), timeout=1)
+    scheduler.schedule_project_index(project_id=13, force_full=True)
+
+    runner.release_first_run.set()
+    await drain_background_tasks()
+
+    assert runner.calls == [(13, False), (13, True)]
+    assert 13 not in _pending_project_index
+    assert 13 not in _dirty_project_index
+
+
+@pytest.mark.asyncio
+async def test_project_index_scheduler_single_flight_is_per_project():
+    """One project's in-flight run must not block another project's run."""
+    _clear_project_index_scheduler_state()
+    runner = GatedProjectIndexRunner()
+    scheduler = LocalProjectIndexScheduler(project_index_runner=runner, test_mode=False)
+
+    scheduler.schedule_project_index(project_id=13)
+    await asyncio.wait_for(runner.first_run_started.wait(), timeout=1)
+
+    scheduler.schedule_project_index(project_id=14)
+    await asyncio.sleep(0.05)
+    # Project 14 ran while project 13 was still in flight.
+    assert runner.calls == [(13, False), (14, False)]
+
+    runner.release_first_run.set()
+    await drain_background_tasks()
+
+    assert runner.calls == [(13, False), (14, False)]
+
+
+@pytest.mark.asyncio
+async def test_project_index_scheduler_is_noop_in_test_mode():
+    """Test mode must suppress the run without leaking a pending marker."""
+    from basic_memory.index.local_schedulers import _pending_project_index
+
+    _clear_project_index_scheduler_state()
+    runner = StubProjectIndexRunner()
+
+    scheduler = LocalProjectIndexScheduler(project_index_runner=runner, test_mode=True)
+    scheduler.schedule_project_index(project_id=13)
+    await drain_background_tasks()
+
+    assert runner.indexed == []
+    assert 13 not in _pending_project_index
+
+
+@pytest.mark.asyncio
+async def test_search_reindex_scheduler_maps_to_search_service():
+    """Search reindex scheduling should rebuild the search index."""
+    search_service = StubSearchService()
+    read_cache = RecordingReadCache()
+
+    scheduler = LocalSearchReindexScheduler(
+        search_service=search_service,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+    )
+    scheduler.schedule_search_reindex(project_id=13)
+    await drain_background_tasks()
+
+    assert search_service.reindexed_project is True
+    assert read_cache.invalidated_project_ids == [PROJECT_EXTERNAL_ID]
+
+
+class StubRelationResolutionRuntime:
+    """Resolves the given source entity ids on its first pass, then nothing."""
+
+    def __init__(self, resolved_sources: set[int] | None = None) -> None:
+        self.resolve_calls = 0
+        self._pending = [resolved_sources] if resolved_sources else []
+
+    async def count_unresolved_relations(self) -> int:
+        return 0
+
+    async def resolve_relations(self, entity_id: int | None = None) -> set[int]:
+        self.resolve_calls += 1
+        return self._pending.pop(0) if self._pending else set()
+
+
+class StubVectorSync:
+    """Records entity batches handed to the scheduler's vector-sync step."""
+
+    def __init__(self) -> None:
+        self.batches: list[list[int]] = []
+
+    async def sync_entity_vectors_batch(self, entity_ids: list[int]) -> VectorSyncBatchResult:
+        self.batches.append(list(entity_ids))
+        return VectorSyncBatchResult(
+            entities_total=len(entity_ids),
+            entities_synced=len(entity_ids),
+            entities_failed=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_runs_project_resolution(session_maker):
+    """A single write schedules one debounced project resolution pass."""
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    runtime = StubRelationResolutionRuntime()
+    read_cache = RecordingReadCache()
+
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+        debounce_seconds=0.0,
+    )
+    scheduler.schedule_relation_resolution(project_id=13)
+    await drain_background_tasks()
+
+    assert runtime.resolve_calls == 1
+    # A pass that resolved nothing changed nothing, so it retires nothing.
+    assert read_cache.invalidated_project_ids == []
+    # The pending marker is cleared after the pass so later writes can schedule.
+    assert 13 not in _pending_relation_resolution
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_syncs_resolved_source_vectors(
+    session_maker,
+) -> None:
+    """A scheduled pass re-embeds the source notes whose links it resolved (#1873)."""
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    runtime = StubRelationResolutionRuntime(resolved_sources={22, 11})
+    vector_sync = StubVectorSync()
+
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=None,
+        test_mode=False,
+        debounce_seconds=0.0,
+        vector_sync=vector_sync,
+    )
+    scheduler.schedule_relation_resolution(project_id=13)
+    await drain_background_tasks()
+
+    assert vector_sync.batches == [[11, 22]]
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_reembeds_resolved_source_relations(
+    test_project,
+    entity_service,
+    entity_repository,
+    relation_repository,
+    session_maker,
+    search_service,
+    app_config,
+) -> None:
+    """A write-path resolution pass leaves the source's relation vectors current (#1873).
+
+    The source note is embedded while its link is still dangling; writing the target
+    then lets the scheduler resolve that link. Its refreshed search row must be
+    re-embedded, not left carrying the unresolved relation text.
+    """
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    source = await entity_service.create_entity(
+        EntitySchema(
+            title="Scheduler Source",
+            directory="notes",
+            note_type="note",
+            content="# Scheduler Source\n\n- relates_to [[Scheduler Target]]\n",
+        )
+    )
+    await search_service.index_entity(source)
+    await search_service.sync_entity_vectors_batch([source.id])
+
+    target = await entity_service.create_entity(
+        EntitySchema(
+            title="Scheduler Target",
+            directory="notes",
+            note_type="note",
+            content="# Scheduler Target\n\nTarget body.\n",
+        )
+    )
+
+    runtime = RepositoryRelationResolutionRuntime(
+        session_maker=session_maker,
+        relation_repository=relation_repository,
+        entity_repository=entity_repository,
+        note_content_repository=NoteContentRepository(project_id=test_project.id),
+        target_resolver=BulkLinkResolver(
+            entity_repository=entity_repository,
+            app_config=app_config,
+        ),
+        entity_indexer=search_service,
+    )
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=str(test_project.external_id),
+        read_cache=None,
+        test_mode=False,
+        debounce_seconds=0.0,
+        vector_sync=search_service,
+    )
+
+    scheduler.schedule_relation_resolution(project_id=test_project.id)
+    await drain_background_tasks()
+
+    search_rows = await search_service.repository.get_entity_search_rows(source.id)
+    relation_rows = [row for row in search_rows if row.type == SearchItemType.RELATION.value]
+    assert relation_rows
+    assert {row.to_id for row in relation_rows} == {target.id}
+    expected_relation_chunks = {compose_row_source_text(row) for row in relation_rows}
+    manifest = await search_service.repository.get_entity_chunk_manifest(source.id)
+    stored_relation_chunks = {
+        chunk.chunk_text for chunk in manifest if chunk.source_type == SearchItemType.RELATION.value
+    }
+    assert stored_relation_chunks == expected_relation_chunks
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_retires_the_notes_it_resolved(
+    session_maker,
+) -> None:
+    """A pass that resolves links retires content-wide reads and the resolved notes only.
+
+    The stub resolves entity 999, which has no row, so no note id maps and the
+    change is content-only; a whole-project clear would set ``project``.
+    """
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    runtime = StubRelationResolutionRuntime(resolved_sources={999})
+    read_cache = RecordingReadCache()
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+        debounce_seconds=0.0,
+    )
+    scheduler.schedule_relation_resolution(project_id=13)
+    await drain_background_tasks()
+
+    assert read_cache.changes == [ReadCacheChange(content=True)]
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_coalesces_a_burst(session_maker):
+    """A burst of writes collapses to a single project resolution pass."""
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    runtime = StubRelationResolutionRuntime()
+
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=None,
+        test_mode=False,
+        debounce_seconds=0.02,
+    )
+    for _ in range(10):
+        scheduler.schedule_relation_resolution(project_id=7)
+    await drain_background_tasks()
+
+    # Ten writes, one offline pass — not one whole-project scan per write.
+    assert runtime.resolve_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_reruns_for_write_during_pass(session_maker):
+    """A write that commits while a pass is scanning must trigger a follow-up pass,
+    not be dropped by coalescing (the scan already read the unresolved rows)."""
+    from basic_memory.index.local_schedulers import (
+        _dirty_relation_resolution,
+        _pending_relation_resolution,
+    )
+
+    _pending_relation_resolution.clear()
+    _dirty_relation_resolution.clear()
+    read_cache = RecordingReadCache()
+
+    class WriteDuringScanRuntime:
+        def __init__(self) -> None:
+            self.resolve_calls = 0
+            self.scheduler: LocalRelationResolutionScheduler | None = None
+
+        async def count_unresolved_relations(self) -> int:
+            return 0
+
+        async def resolve_relations(self, entity_id: int | None = None) -> set[int]:
+            self.resolve_calls += 1
+            if self.resolve_calls == 1:
+                # A new write lands while the first scan is running.
+                assert self.scheduler is not None
+                self.scheduler.schedule_relation_resolution(project_id=21)
+            return set()
+
+    runtime = WriteDuringScanRuntime()
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=False,
+        debounce_seconds=0.0,
+    )
+    runtime.scheduler = scheduler
+
+    scheduler.schedule_relation_resolution(project_id=21)
+    await drain_background_tasks()
+
+    assert runtime.resolve_calls == 2
+    # Neither pass resolved anything, so neither retires cached reads.
+    assert read_cache.invalidated_project_ids == []
+    assert 21 not in _pending_relation_resolution
+    assert 21 not in _dirty_relation_resolution
+
+
+@pytest.mark.asyncio
+async def test_drain_background_tasks_awaits_scheduled_work():
+    """Draining must complete in-flight scheduled work without relying on sleeps —
+    one-shot CLI clients call it right before closing the event loop."""
+    search_service = StubSearchService()
+
+    scheduler = LocalEntityVectorSyncScheduler(
+        search_service=search_service,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=None,
+        test_mode=False,
+    )
+    scheduler.schedule_entity_vector_sync(entity_id=7, project_id=13)
+
+    await drain_background_tasks()
+
+    assert search_service.vector_synced == [7]
+
+
+@pytest.mark.asyncio
+async def test_drain_background_tasks_covers_follow_up_tasks(session_maker):
+    """A drained task can schedule a follow-up (the relation-resolution dirty
+    re-run); the drain must wait for that wave too, not just the first snapshot."""
+    from basic_memory.index.local_schedulers import (
+        _dirty_relation_resolution,
+        _pending_relation_resolution,
+    )
+
+    _pending_relation_resolution.clear()
+    _dirty_relation_resolution.clear()
+
+    class WriteDuringScanRuntime:
+        def __init__(self) -> None:
+            self.resolve_calls = 0
+            self.scheduler: LocalRelationResolutionScheduler | None = None
+
+        async def count_unresolved_relations(self) -> int:
+            return 0
+
+        async def resolve_relations(self, entity_id: int | None = None) -> set[int]:
+            self.resolve_calls += 1
+            if self.resolve_calls == 1:
+                assert self.scheduler is not None
+                self.scheduler.schedule_relation_resolution(project_id=34)
+            return set()
+
+    runtime = WriteDuringScanRuntime()
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=None,
+        test_mode=False,
+        debounce_seconds=0.0,
+    )
+    runtime.scheduler = scheduler
+
+    scheduler.schedule_relation_resolution(project_id=34)
+
+    await drain_background_tasks()
+
+    assert runtime.resolve_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_relation_resolution_scheduler_is_noop_in_test_mode(session_maker):
+    """Test mode should suppress the background resolution pass entirely."""
+    from basic_memory.index.local_schedulers import _pending_relation_resolution
+
+    _pending_relation_resolution.clear()
+    runtime = StubRelationResolutionRuntime()
+    read_cache = RecordingReadCache()
+
+    scheduler = LocalRelationResolutionScheduler(
+        relation_runtime=runtime,
+        session_maker=session_maker,
+        project_external_id=PROJECT_EXTERNAL_ID,
+        read_cache=read_cache,
+        test_mode=True,
+    )
+    scheduler.schedule_relation_resolution(project_id=13)
+    await drain_background_tasks()
+
+    assert runtime.resolve_calls == 0
+    assert read_cache.invalidated_project_ids == []
+    # Test mode must not leak a pending marker (it never runs the clearer).
+    assert 13 not in _pending_relation_resolution

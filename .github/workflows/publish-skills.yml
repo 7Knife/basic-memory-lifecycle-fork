@@ -1,0 +1,57 @@
+name: Publish Skills
+
+on:
+  push:
+    branches: [main]
+    # Only what changes the archives. The validator also reads the OpenClaw
+    # skill lists, but those never change a zip.
+    paths:
+      - "skills/**"
+      - "scripts/build_skills_dist.py"
+      - "scripts/validate_skills.py"
+      - "scripts/skill-bundle/**"
+      - "scripts/publish_skills_release.py"
+      - ".github/workflows/publish-skills.yml"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# Queue runs instead of cancelling one mid-publish: a cancelled swap could
+# leave a contract asset renamed aside until the next run.
+concurrency:
+  group: publish-skills
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate skills
+        run: python scripts/validate_skills.py skills
+
+      - name: Package skills
+        run: python scripts/build_skills_dist.py
+
+      # The Basic Memory web app links to these assets by name at
+      # https://github.com/basicmachines-co/basic-memory/releases/download/skills-latest/<asset>.
+      # The script checks the asset names, uploads under staging names, and
+      # swaps them in only after every upload succeeds.
+      - name: Publish rolling skill archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find dist/skills dist/skills-openai -maxdepth 1 -type f -name '*.zip' | sort)
+          python scripts/publish_skills_release.py "${assets[@]}"

@@ -1,0 +1,124 @@
+import { Type } from "@sinclair/typebox"
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry"
+import {
+  type BmClient,
+  describeToolError,
+  type ProjectListResult,
+} from "../bm-client.ts"
+import { log } from "../logger.ts"
+
+function normalizeProject(project: ProjectListResult) {
+  return {
+    name: project.name,
+    external_id: project.external_id ?? null,
+    qualified_name: project.qualified_name ?? null,
+    source: project.source ?? null,
+    path: project.path,
+    display_name: project.display_name ?? null,
+    is_private: project.is_private === true,
+    is_default: project.is_default === true || project.isDefault === true,
+    workspace_name: project.workspace_name ?? null,
+    workspace_slug: project.workspace_slug ?? null,
+    workspace_type: project.workspace_type ?? null,
+    workspace_tenant_id: project.workspace_tenant_id ?? null,
+  }
+}
+
+export function registerProjectListTool(
+  api: OpenClawPluginApi,
+  client: BmClient,
+): void {
+  api.registerTool(
+    {
+      name: "list_memory_projects",
+      label: "List Projects",
+      description:
+        "List Basic Memory projects accessible to this agent, optionally filtered by " +
+        "workspace. Returns each project's name, external_id, source (local, cloud, " +
+        "or local+cloud), path, default flag, workspace, and qualified name. " +
+        "Call this before passing `project` to another tool when the user names a " +
+        "project that isn't the default. Pass a project's external_id as " +
+        "`project_id` to route to that exact project.",
+      parameters: Type.Object({
+        workspace: Type.Optional(
+          Type.String({
+            description: "Filter by workspace name, slug, or tenant_id",
+          }),
+        ),
+      }),
+      async execute(_toolCallId: string, params: { workspace?: string }) {
+        log.debug(`list_memory_projects: workspace="${params.workspace ?? ""}"`)
+
+        try {
+          const projects = await client.listProjects(params.workspace)
+          const normalized = projects.map(normalizeProject)
+
+          if (normalized.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "No Basic Memory projects found.",
+                },
+              ],
+              details: {
+                count: 0,
+                projects: [],
+              },
+            }
+          }
+
+          const text = normalized
+            .map((project, idx) => {
+              const defaultSuffix = project.is_default ? " (default)" : ""
+              const lines = [
+                `${idx + 1}. **${project.name}**${defaultSuffix}`,
+                project.external_id ? `   ID: ${project.external_id}` : null,
+                project.source ? `   Source: ${project.source}` : null,
+                `   Path: ${project.path}`,
+                `   Private: ${project.is_private}`,
+                project.display_name
+                  ? `   Display Name: ${project.display_name}`
+                  : null,
+                project.qualified_name
+                  ? `   Qualified Name: ${project.qualified_name}`
+                  : null,
+              ]
+              return lines.filter((line) => line !== null).join("\n")
+            })
+            .join("\n\n")
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Found ${normalized.length} project(s):\n\n${text}`,
+              },
+            ],
+            details: {
+              count: normalized.length,
+              projects: normalized,
+            },
+          }
+        } catch (err) {
+          log.error("list_memory_projects failed", err)
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Failed to list Basic Memory projects: ${describeToolError(err)}`,
+              },
+            ],
+            details: {
+              count: 0,
+              projects: [],
+              workspace: params.workspace ?? null,
+              error: "list_memory_projects_failed",
+            },
+          }
+        }
+      },
+    },
+    { name: "list_memory_projects" },
+  )
+}

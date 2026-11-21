@@ -1,0 +1,25 @@
+# Compact discovery
+
+Use compact results to choose notes before reading their bodies:
+
+```sh
+bm tool search "deployment" --compact --json
+bm tool context "notes/deployment" --compact --json
+bm tool read "notes/deployment" --start-line 20 --end-line 60
+```
+
+`--compact` works with the default text output and with `--json`. Omit
+`--compact` to retain ordinary content-bearing responses.
+
+Search omits note bodies and matched excerpts. Context omits note bodies and entity
+observation lists; observations that surface as primary or related results are
+labeled by category and point at their owning file paths. IDs, relation targets,
+and pagination remain available in JSON.
+
+MCP clients use `bm_search(query="deployment", compact=True, project="main")` and `bm_context(identifier="notes/deployment", compact=True, project="main")`.
+Compact search reduces model-visible output, not database search work. Compact
+context also skips loading observations on the server (`include_observations=false`
+on the `/memory` endpoint); the graph traversal itself is unchanged.
+Neither imposes a fixed token limit: titles, metadata, and the number of graph
+items still affect response size. Use pagination and targeted note reads to bound
+the rest of the workflow.

@@ -1,0 +1,456 @@
+"""Tests for MCP first-connect onboarding (levers 1 & 3).
+
+These cover the changes that help a freshly-connected model orient itself and offer a first
+note against an empty knowledge base and say what it saved:
+
+- the server `instructions` string (surfaced at the `initialize` handshake),
+- the enriched empty-state returns of `recent_activity` (the orientation call) and `search`,
+- the `getting_started` prompt.
+"""
+
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import text
+
+from basic_memory.mcp.prompts.getting_started import getting_started
+from basic_memory.mcp.server import mcp
+from basic_memory.mcp.tools.projects import bm_recent
+from basic_memory.mcp.tools.ranked_search import bm_search
+from basic_memory.mcp.tools.write import bm_write
+
+
+# --- Server instructions (lever 1a) ---
+
+
+def test_server_sets_first_connect_instructions():
+    """The server must ship instructions that orient the model and offer a first note."""
+    instructions = mcp.instructions
+    assert instructions is not None
+    # Orients the model to what Basic Memory is and points at the first-note action.
+    assert "Basic Memory" in instructions
+    assert "bm_recent(project=" in instructions
+    assert "bm_write" in instructions
+    assert "https://docs.basicmemory.com/llms.txt" in instructions
+    assert "/raw/...md" in instructions
+    # Save-and-tell: save by default, say what was saved and how to undo, honor "ask first".
+    assert "tell the user in one line what you saved and how to undo it" in instructions
+    assert "If the user asks you to ask first, ask before every save." in instructions
+    assert "unprompted" not in instructions
+    # find refuses an unqualified root path with several projects, like grep and tail (#1634).
+    assert "bm_find" in instructions
+
+
+# --- recent_activity empty-state (lever 1b, primary) ---
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_empty_project_offers_first_note(
+    client, test_project, indexed_project
+):
+    """An empty project (no test_graph) should surface the save-and-tell first-note guidance."""
+    result = await bm_recent(project=test_project.name, since="7d")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert isinstance(result, str)
+    assert "No recent activity" in result
+    # Save-and-tell: save a first note, say what was saved and how to undo it.
+    assert "tell them in one line what you saved and how to undo it" in result
+    assert "If they asked to approve saves, ask first" in result
+    assert "wait for them to agree" not in result
+    # Examples route by the collision-safe external id, and the widened call stays scoped.
+    assert "bm_write(project=" in result
+    assert 'directory="notes"' in result
+    assert "bm_recent(project=" in result
+    assert 'since="30d"' in result
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_quiet_populated_project_has_no_first_note_offer(
+    client, test_project, indexed_project, session_maker
+):
+    """A project with notes, none changed in the window, gets the hint but no onboarding."""
+    await bm_write(
+        project=test_project.name,
+        title="Old note",
+        content="This project already contains useful context.",
+        directory="notes",
+    )
+    # Move the note out of the 7d window in both the entity table and the search index.
+    old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    async with session_maker() as session:
+        await session.execute(
+            text("UPDATE entity SET created_at = :old, updated_at = :old"), {"old": old}
+        )
+        await session.execute(
+            text("UPDATE search_index SET created_at = :old, updated_at = :old"), {"old": old}
+        )
+        await session.commit()
+
+    result = await bm_recent(project=test_project.name, since="7d")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert isinstance(result, str)
+    assert "No recent activity" in result
+    assert "If the user is just getting started" not in result
+    assert "first note" not in result
+    assert "bm_write(" not in result
+    assert f'bm_recent(project="{test_project.external_id}"' in result
+    assert 'since="30d"' in result
+    assert f'bm_search(project="{test_project.external_id}"' in result
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_empty_path_makes_one_status_request(
+    client, test_project, indexed_project, monkeypatch
+):
+    """The note count comes from the status call the empty path already made."""
+    from basic_memory.mcp.clients.project import ProjectClient
+
+    calls = 0
+    original = ProjectClient.get_status
+
+    async def counting(self, project_external_id):
+        nonlocal calls
+        calls += 1
+        return await original(self, project_external_id)
+
+    monkeypatch.setattr(ProjectClient, "get_status", counting)
+
+    await bm_recent(project=test_project.name, since="7d")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_populated_project_has_no_first_note_offer(
+    client, test_project, test_graph
+):
+    """A populated project must not nag with the first-note offer."""
+    result = await bm_recent(project=test_project.name, since="1w")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert "first note" not in result
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_filtered_empty_result_has_no_first_note_offer(
+    client, test_project, indexed_project
+):
+    """A type-filter miss does not mean an established project has no notes."""
+    await bm_write(
+        project=test_project.name,
+        title="Existing note",
+        content="This project already contains useful context.",
+        directory="notes",
+    )
+
+    result = await bm_recent(
+        project=test_project.name,
+        items=["relation"],
+        since="7d",
+    )
+
+    assert isinstance(result, str)
+    assert "No recent activity matched the requested type filter" in result
+    assert "first note" not in result
+    assert "bm_write(" not in result
+
+
+@pytest.mark.asyncio
+async def test_recent_activity_out_of_range_page_has_no_first_note_offer(
+    client, test_project, test_graph, indexed_project
+):
+    """An empty later page should direct the agent back through pagination."""
+    result = await bm_recent(
+        project=test_project.name,
+        since="7d",
+        page=100,
+    )
+
+    assert isinstance(result, str)
+    assert "No recent activity was found on page 100" in result
+    assert "Try page=99 or return to page=1" in result
+    assert "first note" not in result
+    assert "bm_write(" not in result
+
+
+# --- search empty-state (lever 1b, delegates to recent_activity) ---
+
+
+@pytest.mark.asyncio
+async def test_search_no_results_points_to_recent_activity(client, test_project, indexed_project):
+    """Empty search must point at recent_activity rather than repeat the first-note offer."""
+    result = await bm_search(query="XYZ123NoSuchNote", project=test_project.name)  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert isinstance(result, str)
+    assert "No results" in result
+    # The orientation call stays scoped to the searched project, by collision-safe external id.
+    assert test_project.name in result
+    # It should NOT duplicate the write_note offer here (that would nag established users).
+    assert "bm_write" not in result
+
+
+# --- getting_started prompt (lever 3a) ---
+
+
+@pytest.mark.asyncio
+async def test_getting_started_prompt_is_registered():
+    """The prompt must be registered so clients can surface it as a starter."""
+    prompts = await mcp.list_prompts()
+    names = {p.name for p in prompts}
+    assert "getting_started" in names
+
+
+@pytest.mark.asyncio
+async def test_getting_started_offers_first_note_conditionally(client, test_project):
+    """The guide saves a first note but conditions it on the user being new, and keeps the
+    'already have notes' path — it must not assert emptiness (a quiet base looks the same)."""
+    result = await getting_started(project=test_project.name)  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert "Getting started with Basic Memory" in result
+    assert "bm_write" in result
+    # Save-and-tell.
+    assert "tell them in one" in result
+    assert "If they asked to approve saves, ask first" in result
+    assert "Wait for them to say yes" not in result
+    # Both paths present — the model chooses; the prompt does not decide emptiness for it.
+    assert "If they have no notes yet" in result
+    assert "If they already have notes" in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_preserves_markdown_around_multiline_activity(monkeypatch):
+    """Embedded activity must not turn the surrounding prompt into an indented code block."""
+
+    async def fake_list_memory_projects(**_kwargs: object) -> dict[str, object]:
+        return {
+            "projects": [
+                {
+                    "name": "research",
+                    "qualified_name": "personal/research",
+                    "external_id": "project-1",
+                    "is_default": True,
+                    "workspace_is_default": True,
+                }
+            ],
+            "default_project": "research",
+            "constrained_project": None,
+        }
+
+    async def fake_recent_activity(**_kwargs: object) -> str:
+        return "# Recent activity\n\n- Updated [[Project Plan]]"
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.prompts.getting_started.bm_project_list", fake_list_memory_projects
+    )
+    monkeypatch.setattr("basic_memory.mcp.prompts.getting_started.bm_recent", fake_recent_activity)
+
+    result = await getting_started(project="research")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert result.startswith("# Getting started with Basic Memory")
+    assert "\nBasic Memory gives the user" in result
+    assert "\nHere is their recent activity:" in result
+    assert "\n# Recent activity\n" in result
+    assert "\nBased on what you see above:" in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_keeps_selected_project_in_all_examples(client, test_project):
+    """Every example call (first-note and continuation) must target the inspected project so
+    onboarding never crosses into write_note's default project."""
+    result = await getting_started(project=test_project.name)  # pyright: ignore[reportGeneralTypeIssues]
+
+    project_id = test_project.external_id
+    assert f'bm_write(project="{project_id}"' in result
+    assert f'bm_search(project="{project_id}"' in result
+    assert f'bm_read(project="{project_id}", identifier="permalink")' in result
+    assert 'directory="notes"' in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_no_project_uses_concrete_default_project(client, test_project):
+    """Without an explicit project, onboarding resolves the default to its external id."""
+    result = await getting_started()  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert f'bm_write(project="{test_project.external_id}"' in result
+    assert 'bm_write(title="..."' not in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_prefers_constrained_project(monkeypatch):
+    """A single-project server must ignore a conflicting prompt argument."""
+
+    async def fake_list_memory_projects(**_kwargs: object) -> dict[str, object]:
+        return {
+            "projects": [
+                {
+                    "name": "locked",
+                    "external_id": "project-locked",
+                    "is_default": False,
+                },
+                {
+                    "name": "requested",
+                    "external_id": "project-requested",
+                    "is_default": True,
+                },
+            ],
+            "default_project": "requested",
+            "constrained_project": "locked",
+        }
+
+    activity_calls: list[dict[str, object]] = []
+
+    async def fake_recent_activity(**kwargs: object) -> str:
+        activity_calls.append(kwargs)
+        return "# Recent activity\n\nNo recent activity"
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.prompts.getting_started.bm_project_list", fake_list_memory_projects
+    )
+    monkeypatch.setattr("basic_memory.mcp.prompts.getting_started.bm_recent", fake_recent_activity)
+
+    result = await getting_started(  # pyright: ignore[reportGeneralTypeIssues]
+        project="requested"
+    )
+
+    assert activity_calls == [{"since": "30d", "project": "project-locked"}]
+    assert 'bm_write(project="project-locked"' in result
+    assert "project-requested" not in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_preserves_merged_local_project_route(monkeypatch):
+    """A configured mirror must win over a same-named default-workspace copy."""
+
+    async def fake_list_memory_projects(**_kwargs: object) -> dict[str, object]:
+        return {
+            "projects": [
+                {
+                    "name": "main",
+                    "qualified_name": "personal/main",
+                    "external_id": "cloud-personal-main",
+                    "source": "cloud",
+                    "is_default": True,
+                    "workspace_is_default": True,
+                },
+                {
+                    "name": "main",
+                    "qualified_name": "team/main",
+                    "external_id": "cloud-team-main",
+                    "source": "local+cloud",
+                    "is_default": True,
+                    "workspace_is_default": False,
+                },
+            ],
+            "default_project": "main",
+            "constrained_project": None,
+        }
+
+    activity_calls: list[dict[str, object]] = []
+
+    async def fake_recent_activity(**kwargs: object) -> str:
+        activity_calls.append(kwargs)
+        return "# Recent activity\n\nNo recent activity"
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.prompts.getting_started.bm_project_list", fake_list_memory_projects
+    )
+    monkeypatch.setattr("basic_memory.mcp.prompts.getting_started.bm_recent", fake_recent_activity)
+
+    result = await getting_started()  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert activity_calls == [{"since": "30d", "project": "main"}]
+    assert 'bm_write(project="main"' in result
+    assert 'bm_read(project="main"' in result
+    assert 'bm_search(project="main"' in result
+    assert "cloud-personal-main" not in result
+    assert "cloud-team-main" not in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_without_projects_stops_before_note_actions(monkeypatch):
+    """A fresh installation must establish a project before advertising note operations."""
+
+    async def fake_list_memory_projects(**_kwargs: object) -> dict[str, object]:
+        return {
+            "projects": [],
+            "default_project": None,
+            "constrained_project": None,
+        }
+
+    async def fail_recent_activity(**_kwargs: object) -> str:
+        raise AssertionError("recent_activity requires a selected project")
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.prompts.getting_started.bm_project_list", fake_list_memory_projects
+    )
+    monkeypatch.setattr("basic_memory.mcp.prompts.getting_started.bm_recent", fail_recent_activity)
+
+    result = await getting_started()  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert "No Basic Memory projects are available yet" in result
+    assert "bm_project_list()" in result
+    assert 'bm_recent(project="...", since="30d")' in result
+    assert "invoke this getting-started prompt" not in result
+    assert "bm_write(" not in result
+    assert "bm_read(" not in result
+    assert "bm_search(" not in result
+
+
+@pytest.mark.asyncio
+async def test_getting_started_requires_qualified_duplicate_project_selection(monkeypatch):
+    """Duplicate cloud names pause onboarding, then the qualified choice routes by id."""
+
+    async def fake_list_memory_projects(**_kwargs: object) -> dict[str, object]:
+        return {
+            "projects": [
+                {
+                    "name": "notes",
+                    "qualified_name": "personal/notes",
+                    "external_id": "project-personal",
+                    "source": "local+cloud",
+                    "is_default": False,
+                    "workspace_is_default": True,
+                },
+                {
+                    "name": "notes",
+                    "qualified_name": "team/notes",
+                    "external_id": "project-team",
+                    "source": "cloud",
+                    "is_default": False,
+                    "workspace_is_default": False,
+                },
+            ],
+            "default_project": None,
+            "constrained_project": None,
+        }
+
+    activity_calls: list[dict[str, object]] = []
+
+    async def fake_recent_activity(**kwargs: object) -> str:
+        activity_calls.append(kwargs)
+        return "# Recent activity\n\nNo recent activity"
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.prompts.getting_started.bm_project_list", fake_list_memory_projects
+    )
+    monkeypatch.setattr("basic_memory.mcp.prompts.getting_started.bm_recent", fake_recent_activity)
+
+    result = await getting_started(project="notes")  # pyright: ignore[reportGeneralTypeIssues]
+
+    assert 'requested project "notes" did not identify one unique project' in result
+    assert "`personal/notes`" in result
+    assert "`team/notes`" in result
+    assert 'project="notes"' in result
+    assert 'project="project-team"' in result
+    assert "`bm_recent(...)`" in result
+    assert "invoke this getting-started prompt" not in result
+    assert "bm_write(" not in result
+    assert "bm_read(" not in result
+    assert "bm_search(" not in result
+    assert activity_calls == []
+
+    selected_result = await getting_started(  # pyright: ignore[reportGeneralTypeIssues]
+        project="team/notes"
+    )
+
+    assert activity_calls == [{"since": "30d", "project": "project-team"}]
+    assert 'bm_write(project="project-team"' in selected_result

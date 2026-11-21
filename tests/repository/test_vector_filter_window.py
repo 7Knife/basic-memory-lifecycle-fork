@@ -1,0 +1,355 @@
+"""A filtered vector search fills its candidate window instead of stopping short.
+
+The adapter ranks by similarity alone and knows nothing of structured filters. A window
+taken straight from that ranking and filtered afterwards can hold few admitted rows while
+more sit just past it, so a page came back short although matches existed. The reader now
+re-reads the window with a bounded geometric overfetch until it holds enough admitted rows,
+the ranking is exhausted, or its tail has fallen below the similarity threshold.
+"""
+
+from collections.abc import Sequence
+from dataclasses import replace
+from typing import Any, cast, override
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from basic_memory.repository.search_index_row import SearchIndexKey, SearchIndexRow
+from basic_memory.repository.search_query import PreparedSearchQuery
+from basic_memory.repository.search_reader import (
+    VECTOR_FILTER_SCAN_LIMIT,
+    HydratedChunk,
+    SemanticSearch,
+)
+from basic_memory.repository.search_scope import ProjectScope
+from basic_memory.repository.search_trace import SearchTraceCollector
+from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
+from tests.repository.test_hybrid_fusion import (
+    FakeFts,
+    FakeRow,
+    fake_vector_retrieval,
+    OfflineSemanticSearch,
+)
+from tests.repository.test_vector_threshold import fake_session_maker
+
+FILTERED = PreparedSearchQuery(
+    search_text="test", retrieval_mode=SearchRetrievalMode.VECTOR, file_path_prefix="notes"
+)
+UNFILTERED = PreparedSearchQuery(search_text="test", retrieval_mode=SearchRetrievalMode.VECTOR)
+
+
+class AdmittingFts(FakeFts):
+    """Answers a filter pass with exactly the candidates in ``admitted``."""
+
+    def __init__(self, admitted: set[int]) -> None:
+        super().__init__()
+        self.admitted = admitted
+
+    @override
+    async def search(
+        self,
+        scope: ProjectScope,
+        query: PreparedSearchQuery,
+        *,
+        limit: int,
+        offset: int,
+        allow_relaxed: bool = False,
+        session: AsyncSession | None = None,
+        candidate_keys: Sequence[SearchIndexKey] | None = None,
+        trace: SearchTraceCollector | None = None,
+        with_text: bool = True,
+    ) -> list[SearchIndexRow]:
+        self.calls.append({"candidate_keys": list(candidate_keys or [])})
+        return cast(
+            list[SearchIndexRow],
+            [
+                FakeRow(id=row_id)
+                for _type, row_id in candidate_keys or []
+                if row_id in self.admitted
+            ],
+        )
+
+
+def _ranking(count: int, *, top: float = 0.99, step: float = 0.01) -> list[HydratedChunk]:
+    """Rows 1..count, nearest first, similarity falling by ``step`` per rank."""
+    return [
+        HydratedChunk(
+            entity_id=row_id,
+            chunk_key=f"entity:{row_id}:0",
+            source_key=("entity", row_id),
+            similarity=top - (row_id - 1) * step,
+        )
+        for row_id in range(1, count + 1)
+    ]
+
+
+def _adapter(ranking: list[HydratedChunk]) -> AsyncMock:
+    """A neighbour stage that hands back the top ``candidate_limit`` of a fixed ranking."""
+
+    async def run(
+        session: Any,
+        embedding: Any,
+        candidate_limit: int,
+        *,
+        admission: Any = None,
+        row_target: int = 0,
+        trace: Any = None,
+    ):
+        return ranking[:candidate_limit]
+
+    return AsyncMock(side_effect=run)
+
+
+def _rows() -> AsyncMock:
+    async def fetch(row_ids: list[int]) -> dict[SearchIndexKey, Any]:
+        return {
+            ("entity", row_id): FakeRow(id=row_id, file_path=f"row-{row_id}.md")
+            for row_id in row_ids
+        }
+
+    return AsyncMock(side_effect=fetch)
+
+
+def _semantic(
+    fts: FakeFts,
+    *,
+    vector_k: int = 4,
+    min_similarity: float = 0.0,
+    index_name: str = "milvus",
+) -> SemanticSearch:
+    """Defaults to an external index: only external indexes filter in the reader and widen."""
+    return OfflineSemanticSearch(
+        fake_session_maker(),
+        ProjectScope.single(1),
+        fts,
+        fake_vector_retrieval(
+            vector_k=vector_k, min_similarity=min_similarity, index_name=index_name
+        ),
+    )
+
+
+async def _search(
+    semantic: SemanticSearch,
+    adapter: AsyncMock,
+    *,
+    query: PreparedSearchQuery,
+    limit: int = 2,
+) -> list[int]:
+    with (
+        patch.object(semantic, "_run_vector_query", adapter),
+        patch.object(semantic, "_fetch_search_index_rows_by_ids", _rows()),
+    ):
+        rows = await semantic.vector_only(query, limit=limit, offset=0)
+    return [row.id for row in rows if row.id is not None]
+
+
+def _windows(adapter: AsyncMock) -> list[int]:
+    return [call.args[2] for call in adapter.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_the_window_widens_until_the_filter_has_admitted_enough_rows():
+    """Twenty rejected neighbours in front of five admitted ones still yield a full page."""
+    fts = AdmittingFts(admitted={21, 22, 23, 24, 25})
+    adapter = _adapter(_ranking(25))
+
+    # limit 2 with vector_k 4 sizes the window at 20 chunks, all of them rejected.
+    found = await _search(_semantic(fts), adapter, query=FILTERED)
+
+    assert found == [21, 22]
+    assert _windows(adapter) == [20, 40]
+
+
+@pytest.mark.asyncio
+async def test_a_query_without_filters_reads_its_window_once():
+    fts = AdmittingFts(admitted=set())
+    adapter = _adapter(_ranking(25))
+
+    found = await _search(_semantic(fts), adapter, query=UNFILTERED)
+
+    assert found == [1, 2]
+    assert _windows(adapter) == [20]
+    assert fts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_ranking_ends_the_search_with_what_it_admitted():
+    """When the adapter has nothing past the window, a short answer is the true answer."""
+    fts = AdmittingFts(admitted={5})
+    adapter = _adapter(_ranking(12))
+
+    found = await _search(_semantic(fts), adapter, query=FILTERED)
+
+    assert found == [5]
+    # The first read came back short of its own window: nothing further exists.
+    assert _windows(adapter) == [20]
+
+
+@pytest.mark.asyncio
+async def test_a_ranking_that_stops_growing_is_exhausted():
+    """An adapter capped below the widened window cannot be asked forever."""
+    fts = AdmittingFts(admitted=set())
+    adapter = _adapter(_ranking(20))
+
+    found = await _search(_semantic(fts), adapter, query=FILTERED)
+
+    assert found == []
+    assert _windows(adapter) == [20, 40]
+
+
+@pytest.mark.asyncio
+async def test_a_tail_below_the_threshold_ends_the_widening():
+    """Nothing past a sub-threshold tail can qualify, whatever the filter would admit."""
+    fts = AdmittingFts(admitted={30})
+    # Similarities fall from 0.99 by 0.03 per rank: rank 20 sits at 0.42, under 0.5.
+    adapter = _adapter(_ranking(40, step=0.03))
+
+    found = await _search(_semantic(fts, min_similarity=0.5), adapter, query=FILTERED)
+
+    assert found == []
+    assert _windows(adapter) == [20]
+
+
+@pytest.mark.asyncio
+async def test_the_widening_is_bounded_by_the_scan_limit():
+    fts = AdmittingFts(admitted=set())
+    adapter = _adapter(_ranking(VECTOR_FILTER_SCAN_LIMIT + 10, step=0.0))
+
+    found = await _search(_semantic(fts), adapter, query=FILTERED)
+
+    assert found == []
+    windows = _windows(adapter)
+    assert windows[0] == 20
+    assert windows[-1] == VECTOR_FILTER_SCAN_LIMIT
+    assert all(
+        later == min(earlier * 2, VECTOR_FILTER_SCAN_LIMIT)
+        for earlier, later in zip(windows, windows[1:])
+    )
+
+
+@pytest.mark.asyncio
+async def test_each_round_asks_the_filter_only_about_rows_that_exist():
+    """The filter pass is bounded by the candidates, never a page of the whole match set."""
+    fts = AdmittingFts(admitted={21, 22})
+    adapter = _adapter(_ranking(25))
+
+    await _search(_semantic(fts), adapter, query=FILTERED)
+
+    asked = [sorted(row_id for _type, row_id in call["candidate_keys"]) for call in fts.calls]
+    assert asked == [list(range(1, 21)), list(range(1, 26))]
+
+
+def _multi_chunk_ranking(rows: int, chunks_per_row: int) -> list[HydratedChunk]:
+    """Rows 1..rows, each cut into ``chunks_per_row`` chunks, nearest row first."""
+    ranking: list[HydratedChunk] = []
+    for row_id in range(1, rows + 1):
+        for chunk in range(chunks_per_row):
+            ranking.append(
+                HydratedChunk(
+                    entity_id=row_id,
+                    chunk_key=f"entity:{row_id}:{chunk}",
+                    source_key=("entity", row_id),
+                    similarity=0.99 - len(ranking) * 0.0001,
+                )
+            )
+    return ranking
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_window_that_fills_the_page_reads_once():
+    """Large notes own dozens of chunks; admitted rows never reach a chunk-sized budget (#1746).
+
+    Every row passes the filter (as every entity passes the default entity_types filter),
+    so the first window already holds a full page and must not widen.
+    """
+    fts = AdmittingFts(admitted=set(range(1, 1001)))
+    # 52 chunks per note, as measured in production: a 100-chunk window covers two notes.
+    adapter = _adapter(_multi_chunk_ranking(rows=1000, chunks_per_row=52))
+
+    found = await _search(_semantic(fts, vector_k=100), adapter, query=FILTERED)
+
+    assert found == [1, 2]
+    # Before #1746 this widened 100, 200, 400 ... to the 50,000-chunk scan limit.
+    assert _windows(adapter) == [100]
+
+
+@pytest.mark.asyncio
+async def test_a_filtered_window_widens_only_to_the_page_it_must_fill():
+    """Widening stops once the page is full, not when admitted rows match the chunk budget."""
+    # Only even rows pass. Each row has 10 chunks, so a 20-chunk window covers two
+    # rows and admits one; the page needs two.
+    fts = AdmittingFts(admitted=set(range(2, 1001, 2)))
+    adapter = _adapter(_multi_chunk_ranking(rows=1000, chunks_per_row=10))
+
+    found = await _search(_semantic(fts), adapter, query=FILTERED)
+
+    assert found == [2, 4]
+    assert _windows(adapter) == [20, 40]
+
+
+@pytest.mark.asyncio
+async def test_a_built_in_index_receives_the_filter_and_reads_once():
+    """sqlite-vec and pgvector rank only admitted chunks: one read, no filter pass (#1746)."""
+    fts = AdmittingFts(admitted=set())
+    adapter = _adapter(_ranking(25))
+
+    found = await _search(_semantic(fts, index_name="sqlite-vec"), adapter, query=FILTERED)
+
+    # The stubbed adapter ignores the admission, so every row comes back unfiltered.
+    assert found == [1, 2]
+    assert _windows(adapter) == [20]
+    assert adapter.await_args is not None
+    admission = adapter.await_args.kwargs["admission"]
+    assert admission.predicate.startswith("(c.project_id, c.source_type, c.source_row_id) IN (")
+    # The row filter got the structured filters without the text; no filter pass ran.
+    assert [query.file_path_prefix for query in fts.queries] == ["notes"]
+    assert all(query.search_text is None for query in fts.queries)
+    assert fts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_entity_type_filter_is_a_chunk_column_predicate():
+    """The default MCP filter needs no subquery: chunks already carry their row type."""
+    fts = AdmittingFts(admitted=set())
+    semantic = _semantic(fts, index_name="sqlite-vec")
+
+    admission = await semantic._vector_admission(
+        replace(UNFILTERED, search_item_types=[SearchItemType.ENTITY])
+    )
+
+    assert admission is not None
+    assert admission.predicate == "c.source_type IN (:admit_type_0)"
+    assert dict(admission.params) == {"admit_type_0": "entity"}
+    assert fts.queries == []
+
+
+@pytest.mark.asyncio
+async def test_a_query_without_filters_has_no_admission():
+    assert (
+        await _semantic(AdmittingFts(set()), index_name="sqlite-vec")._vector_admission(UNFILTERED)
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_built_in_index_reads_its_row_window_once():
+    """A built-in index returns rows, so a short window is the whole answer (#1746).
+
+    Chunks collapse to rows in the database: a window of 100 is 100 rows however many
+    chunks each note holds. Fewer rows than the page means fewer admitted rows exist,
+    so the reader does not re-read a wider window.
+    """
+    fts = AdmittingFts(admitted=set())
+    adapter = _adapter(_ranking(2))
+
+    found = await _search(
+        _semantic(fts, vector_k=100, index_name="sqlite-vec"), adapter, query=FILTERED, limit=5
+    )
+
+    assert found == [1, 2]
+    assert _windows(adapter) == [100]
+    assert adapter.await_args is not None
+    assert adapter.await_args.kwargs["admission"] is not None
+    # The index admitted the rows, so no reader-side filter pass ran.
+    assert fts.calls == []

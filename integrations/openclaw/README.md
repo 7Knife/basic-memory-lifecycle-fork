@@ -1,0 +1,309 @@
+# openclaw-basic-memory
+
+Give your OpenClaw agent persistent, searchable memory — in plain text files you can read and edit.
+
+## What is Basic Memory?
+
+[Basic Memory](https://basicmemory.com) stores AI knowledge in local Markdown files and indexes them into a semantic knowledge graph. Your agent writes notes. You can open them in any editor, read them, change them, and the changes sync back automatically. No black box. No proprietary format. Just files.
+
+It does three things that work together:
+
+- **Stores knowledge in plain Markdown** — everything lives in plain text files on your computer, not locked inside a database you can't read
+- **Creates connections automatically** — notes link to each other through a searchable, traversable knowledge graph
+- **Searches by meaning, not just keywords** — vector search finds relevant context even when the exact words don't match
+- **Keeps notes consistent** — dynamic schemas and validation ensure your knowledge base stays structured and useful as it grows
+- **Enables two-way collaboration** — both you and the AI read and write the same files
+
+Over time, your agent builds a knowledge base that grows with you. Context that survives across sessions. Memory that belongs to you.
+
+Learn more: [basicmemory.com](https://basicmemory.com) · [GitHub](https://github.com/basicmachines-co/basic-memory) · [Docs](https://docs.basicmemory.com)
+
+Source now lives in the canonical [`basic-memory`](https://github.com/basicmachines-co/basic-memory) repository under `integrations/openclaw/`. The npm package remains `@basicmemory/openclaw-basic-memory`.
+
+Maintainer check from the monorepo root:
+
+```bash
+just package-check-openclaw
+```
+
+## What this plugin does
+
+This plugin connects Basic Memory to OpenClaw so your agent can:
+
+- **Remember across sessions** — search and recall past conversations, decisions, and context
+- **Track work in progress** — structured tasks that survive context compaction
+- **Build knowledge over time** — notes, observations, and relations that grow into a connected graph
+- **Search intelligently** — hybrid full-text and vector search across the knowledge graph
+
+All data stays on your machine as Markdown files indexed locally with SQLite. Cloud sync is available but entirely optional.
+
+## Install
+
+**Prerequisite:** [uv](https://docs.astral.sh/uv/) (Python package manager) — used to install the Basic Memory CLI.
+
+```bash
+# macOS
+brew install uv
+
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then install the plugin:
+
+```bash
+openclaw plugins install @basicmemory/openclaw-basic-memory
+openclaw config set plugins.slots.memory openclaw-basic-memory
+openclaw config set plugins.slots.contextEngine openclaw-basic-memory
+openclaw gateway restart
+```
+
+The plugin fills two OpenClaw slots, and each one does a different job:
+
+- **`memory`** registers Basic Memory as OpenClaw's memory provider: gateway memory search and status, `openclaw doctor` health, Active Memory recall, and the pre-compaction memory flush.
+- **`contextEngine`** runs automatic recall at session start and automatic conversation capture after each turn. **Without this slot, nothing is captured or recalled automatically**; the agent only remembers what it saves with an explicit tool call.
+
+Tested with OpenClaw 2026.10.9. OpenClaw 2026.10 and later require context engines to commit turns through `commitTurn`, which this plugin implements; older plugin versions are degraded to OpenClaw's legacy engine on those hosts and capture nothing.
+
+That's it. The plugin auto-installs the `bm` CLI on first startup if it's not already on your PATH. See [SECURITY.md](./SECURITY.md) for details on how this works.
+
+Verify:
+
+```bash
+openclaw plugins list
+openclaw plugins inspect openclaw-basic-memory --json
+openclaw plugins doctor
+```
+
+## Configuration
+
+### Zero-config (recommended)
+
+```json5
+{
+  plugins: {
+    entries: {
+      "openclaw-basic-memory": {
+        enabled: true
+      }
+    },
+    slots: {
+      memory: "openclaw-basic-memory",
+      contextEngine: "openclaw-basic-memory"
+    }
+  }
+}
+```
+
+This uses sensible defaults: auto-generated project name, maps to your workspace root, captures conversations, and recalls active tasks on session start.
+
+### Full options
+
+```json5
+{
+  plugins: {
+    entries: {
+      "openclaw-basic-memory": {
+        enabled: true,
+        config: {
+          project: "my-agent",        // BM project name (default: "openclaw-{hostname}")
+          projectPath: ".",            // Project directory (default: workspace root, or an existing project's folder)
+          memoryDir: "memory/",        // Where task notes live
+          memoryFile: "MEMORY.md",     // Working memory file
+          autoCapture: true,           // Record conversations as daily notes
+          autoRecall: true,            // Inject active tasks + recent activity at session start
+          debug: false                 // Verbose logging
+        }
+      }
+    },
+    slots: {
+      memory: "openclaw-basic-memory",
+      contextEngine: "openclaw-basic-memory"
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `project` | `"openclaw-{hostname}"` | Basic Memory project name |
+| `bmPath` | `"bm"` | Path to BM CLI binary |
+| `projectPath` | `"."` | Project data directory, relative to the workspace or absolute. When unset and a project named `project` already exists, the plugin uses that project's stored folder. When set, it must match the stored folder; otherwise Basic Memory refuses the project and the plugin logs where it is stored |
+| `memoryDir` | `"memory/"` | Relative path for task scanning |
+| `memoryFile` | `"MEMORY.md"` | Working memory file for text search |
+| `autoCapture` | `true` | Auto-index agent conversations |
+| `captureMinChars` | `10` | Min chars to trigger capture |
+| `autoRecall` | `true` | Inject context at session start |
+| `recallPrompt` | *(default)* | Instruction appended to recalled context |
+| `debug` | `false` | Verbose logs |
+
+## How it works
+
+### Memory search
+
+Agents search Basic Memory with `search_notes` and read results with `read_note`. The plugin adds a short system-prompt section that points the agent at these tools.
+
+OpenClaw's built-in `memory_search` and `memory_get` tools belong to its bundled Memory Core plugin, which OpenClaw keeps loaded even when this plugin holds the memory slot. Those tools search only the workspace `MEMORY.md` and `memory/` files, not Basic Memory.
+
+As the memory slot owner, the plugin also serves OpenClaw's own memory consumers:
+
+- **Gateway memory search, get and status, and `openclaw doctor`** read Basic Memory through the plugin's provider runtime.
+- **Active Memory deep recall** uses `search_notes`, `read_note` and `build_context`.
+- **Pre-compaction flush** saves durable context with `write_note` and `edit_note` instead of appending to a workspace file.
+
+Search scores are shown as raw numbers. A score above 1 means the note matched on both keywords and meaning.
+
+### Auto-recall
+
+On each session start, the plugin loads active tasks and recently modified notes, giving the agent immediate awareness of ongoing work without being asked.
+
+### Auto-capture
+
+After each conversation turn, the plugin records the exchange as a timestamped entry in a daily note. This builds a searchable history of everything your agent has discussed. Capture requires the `contextEngine` slot. Each entry carries a hidden `<!-- openclaw-turn:... -->` marker so a turn OpenClaw retries after a crash is recorded only once.
+
+### Persistent connection
+
+The plugin keeps a long-lived Basic Memory process running over standard I/O. No cold starts per tool call. The connection auto-reconnects if it drops.
+
+## Agent tools
+
+All tools accept an optional `project` parameter for cross-project operations.
+
+| Tool | Description |
+|------|-------------|
+| `search_notes` | Search the knowledge graph directly |
+| `read_note` | Read a note by title, permalink, or `memory://` URL |
+| `write_note` | Create or overwrite a note with optional tags, note type, and custom frontmatter metadata |
+| `edit_note` | Append, prepend, replace content, and merge custom frontmatter metadata |
+| `delete_note` | Delete a note |
+| `move_note` | Move a note to a different folder |
+| `build_context` | Navigate the knowledge graph — follow relations and connections |
+| `list_memory_projects` | List accessible projects |
+| `list_workspaces` | List workspaces (personal and org) |
+| `schema_validate` | Validate notes against Picoschema definitions |
+| `schema_infer` | Analyze notes and suggest a schema |
+| `schema_diff` | Detect drift between schema and actual usage |
+
+Use the dedicated frontmatter parameters when creating structured notes:
+
+```
+write_note(
+  title="auth-middleware-rollout",
+  folder="tasks",
+  note_type="Task",
+  tags=["auth", "rollout"],
+  metadata={"status": "active", "current_step": 2},
+  content="""## Context
+Rolling JWT middleware to all API routes."""
+)
+```
+
+`edit_note` accepts `metadata` alongside any edit operation, so content and frontmatter state can be updated in one call. Metadata keys supplied by the caller are merged into existing frontmatter; unrelated fields remain unchanged.
+
+## Slash commands
+
+| Command | Description |
+|---------|-------------|
+| `/bm-setup` | Install or update the Basic Memory CLI |
+| `/remember <text>` | Save a quick note |
+| `/recall <query>` | Search the knowledge graph |
+| `/tasks [args]` | Create, track, resume structured tasks |
+| `/reflect [args]` | Consolidate recent notes into long-term memory |
+| `/defrag [args]` | Reorganize and clean up memory files |
+| `/schema [args]` | Manage Picoschema definitions |
+
+## CLI
+
+```bash
+openclaw basic-memory search "auth patterns" --limit 5
+openclaw basic-memory read "projects/api-redesign"
+openclaw basic-memory context "memory://projects/api-redesign" --depth 2
+openclaw basic-memory recent --timeframe 24h
+openclaw basic-memory status
+```
+
+## Bundled skills
+
+These skills ship with the plugin — no installation needed:
+
+- **memory-comark** — charts, tables, boards, and live views in notes with `::bm-*` components
+- **memory-defrag** — cleanup and reorganization of a project's notes
+- **memory-ingest** — import existing material into Basic Memory
+- **memory-lifecycle** — manage note/project lifecycle workflows
+- **memory-literary-analysis** — analyze texts and reading notes
+- **memory-metadata-search** — query notes by frontmatter fields
+- **memory-notes** — guidance for writing well-structured notes
+- **memory-okf** — make a project ready for OKF export
+- **memory-onboarding** — guided setup of a new knowledge system
+- **memory-reflect** — periodic consolidation of recent notes into durable memory
+- **memory-research** — research synthesis into durable notes
+- **memory-schema** — schema lifecycle (infer, create, validate, diff)
+- **memory-start** — a new user's first session: save one note, see it, get it back
+- **memory-tasks** — structured task tracking that survives context compaction
+
+### Updating skills
+
+```bash
+bun run fetch-skills
+```
+
+In the monorepo, this copies from the canonical top-level [`skills/`](../../skills) directory into the generated `integrations/openclaw/skills/` package bundle.
+
+## Task notes
+
+The plugin works well with structured task notes in `memory/tasks/`:
+
+```markdown
+---
+title: auth-middleware-rollout
+type: Task
+status: active
+current_step: 2
+---
+
+## Context
+Rolling JWT middleware to all API routes.
+
+## Plan
+- [x] Implement middleware
+- [x] Add refresh-token validation
+- [ ] Roll out to staging
+- [ ] Verify logs and error rates
+```
+
+Set `status: done` to mark complete. Done tasks are filtered out of active task results.
+
+## Basic Memory Cloud
+
+Everything works locally. Cloud adds cross-device sync, team workspaces, and persistent memory for hosted agents.
+
+- Same knowledge graph on laptop, desktop, and CI
+- Shared workspaces for teams
+- Durable memory for production agents
+
+Cloud extends local-first — still plain Markdown, still yours. [Start a free trial](https://basicmemory.com) and use code `BMCLAW` for 20% off for 3 months. See [BASIC_MEMORY.md](./BASIC_MEMORY.md) for setup.
+
+## Troubleshooting
+
+**`bm` not found** — Install uv, then restart the gateway. Or install manually: `uv tool install basic-memory --prerelease=allow` (the flag is required — basic-memory depends on a FastMCP pre-release, and without it uv silently installs an older release)
+
+**Search returns nothing** — Check that Basic Memory connected (look for `connected to BM` in logs). Verify files exist in the project directory.
+
+**Jiti cache issues** — `rm -rf /tmp/jiti/ "$TMPDIR/jiti/"` then restart the gateway.
+
+## More
+
+- [Memory + Task Flow](./MEMORY_TASK_FLOW.md) — practical runbook
+- [Cloud Setup](./BASIC_MEMORY.md) — configure Basic Memory Cloud
+- [Security](./SECURITY.md) — how auto-installation and data handling work
+- [Development](./DEVELOPMENT.md) — contributing, tests, publishing
+- [Basic Memory docs](https://docs.basicmemory.com)
+- [Issues](https://github.com/basicmachines-co/basic-memory/issues)
+
+## Telemetry
+
+This plugin does not collect telemetry. The Basic Memory CLI may send anonymous usage analytics — see the [Basic Memory docs](https://github.com/basicmachines-co/basic-memory) for opt-out instructions.
+
+## License
+
+MIT

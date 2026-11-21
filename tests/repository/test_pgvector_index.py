@@ -1,0 +1,604 @@
+"""Unit tests for the built-in pgvector semantic index adapter."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from unittest.mock import MagicMock
+
+import pytest
+
+from basic_memory.repository import pgvector_index as pgvector_index_module
+from basic_memory.repository.pgvector_index import (
+    EXACT_ADMISSION_CHUNK_LIMIT,
+    PgVectorIndex,
+    hnsw_ef_search_for,
+    pgvector_supports_iterative_scan,
+)
+from basic_memory.repository.search_scope import ProjectScope
+from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
+from basic_memory.repository.semantic_vector_index import (
+    VectorAdmission,
+    VectorDeletion,
+    VectorIndexScope,
+    VectorKey,
+    VectorRecord,
+    VectorRowSearch,
+)
+
+
+class FakeResult:
+    """Small SQLAlchemy result stand-in for adapter boundary tests."""
+
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, object]] | None = None,
+        scalar: object | None = None,
+        fetchone: object | None = None,
+    ) -> None:
+        self._rows = rows or []
+        self._scalar = scalar
+        self._fetchone = fetchone
+
+    def fetchone(self) -> object | None:
+        return self._fetchone
+
+    def one(self) -> dict[str, object]:
+        assert len(self._rows) == 1
+        return self._rows[0]
+
+    def scalar_one_or_none(self) -> object | None:
+        return self._scalar
+
+    def scalar_one(self) -> object:
+        assert self._scalar is not None
+        return self._scalar
+
+    def mappings(self) -> FakeResult:
+        return self
+
+    def all(self) -> list[dict[str, object]]:
+        return self._rows
+
+
+class FakeSession:
+    """Query-aware session that records adapter SQL without PostgreSQL."""
+
+    def __init__(
+        self,
+        *,
+        table_exists: bool = False,
+        dimensions: int | None = None,
+        has_source_hash: bool = True,
+        chunk_rows: list[dict[str, object]] | None = None,
+        search_rows: list[dict[str, object]] | None = None,
+        row_matches: list[dict[str, object]] | None = None,
+        admitted_chunks: int = 0,
+        extension_installed: bool | None = None,
+        extension_available: bool = True,
+        pgvector_version: str = "0.8.0",
+    ) -> None:
+        self.table_exists = table_exists
+        self.dimensions = dimensions
+        self.has_source_hash = has_source_hash
+        self.chunk_rows = chunk_rows or []
+        self.search_rows = search_rows or []
+        self.row_matches = row_matches or []
+        self.admitted_chunks = admitted_chunks
+        # An existing embeddings table implies the extension that defines its type.
+        self.extension_installed = (
+            table_exists if extension_installed is None else extension_installed
+        )
+        self.extension_available = extension_available
+        self.pgvector_version = pgvector_version
+        self.calls: list[tuple[str, dict[str, object] | None]] = []
+        self.commit_count = 0
+
+    async def execute(
+        self,
+        statement: object,
+        params: dict[str, object] | None = None,
+    ) -> FakeResult:
+        sql = str(statement)
+        self.calls.append((sql, params))
+        if "AS has_indexes" in sql:
+            return FakeResult(
+                rows=[
+                    {
+                        "extversion": (self.pgvector_version if self.extension_installed else None),
+                        "dimensions": self.dimensions if self.table_exists else None,
+                        "has_source_hash": self.table_exists and self.has_source_hash,
+                        "has_indexes": self.table_exists,
+                    }
+                ]
+            )
+        if "pg_available_extensions" in sql:
+            return FakeResult(scalar=1 if self.extension_available else None)
+        if "CREATE EXTENSION" in sql:
+            assert self.extension_available, "CREATE EXTENSION on a server without pgvector"
+            self.extension_installed = True
+        if "SELECT extversion" in sql:
+            return FakeResult(scalar=self.pgvector_version)
+        if "SELECT id, entity_id, chunk_key" in sql:
+            return FakeResult(rows=self.chunk_rows)
+        if "AS similarity" in sql:
+            return FakeResult(rows=self.search_rows)
+        # The collapse query also counts its candidates, so match it first.
+        if "chunk_rank" in sql:
+            return FakeResult(rows=self.row_matches)
+        if "SELECT count(*)" in sql:
+            return FakeResult(scalar=self.admitted_chunks)
+        return FakeResult()
+
+    async def commit(self) -> None:
+        self.commit_count += 1
+
+
+PROJECT = 7
+PROJECTS = ProjectScope.single(PROJECT)
+
+
+def _scope(dimensions: int = 4) -> VectorIndexScope:
+    return VectorIndexScope(
+        namespace="basic-memory-test",
+        embedding_identity="stub:4",
+        dimensions=dimensions,
+    )
+
+
+def _install_session(monkeypatch: pytest.MonkeyPatch, session: FakeSession) -> None:
+    @asynccontextmanager
+    async def fake_scoped_session(_session_maker: object) -> AsyncIterator[FakeSession]:
+        yield session
+
+    monkeypatch.setattr(pgvector_index_module.db, "scoped_session", fake_scoped_session)
+
+
+def _sql_calls(session: FakeSession) -> list[str]:
+    return [sql for sql, _params in session.calls]
+
+
+def _assert_no_ddl(session: FakeSession) -> None:
+    """Runtime vector calls must never issue DDL; storage exists before runtime."""
+    ddl = ("CREATE ", "DROP ", "ALTER ")
+    assert not [sql for sql in _sql_calls(session) if any(word in sql for word in ddl)]
+
+
+@pytest.mark.asyncio
+async def test_create_storage_creates_storage_and_invalidates_manifest(monkeypatch) -> None:
+    session = FakeSession()
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.create_storage()
+
+    sql_calls = _sql_calls(session)
+    assert sum("CREATE EXTENSION" in sql for sql in sql_calls) == 1
+    assert any("embedding vector(4)" in sql for sql in sql_calls)
+    assert any("USING hnsw" in sql for sql in sql_calls)
+    assert any("embedding_status = 'pending'" in sql for sql in sql_calls)
+    assert session.commit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_create_storage_runs_no_ddl_when_storage_is_current(monkeypatch) -> None:
+    """Current storage needs only a catalog read: DDL would lock the table every job."""
+    session = FakeSession(table_exists=True, dimensions=4)
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.create_storage()
+
+    [probe] = _sql_calls(session)
+    assert "AS has_indexes" in probe
+    assert session.commit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_create_storage_keeps_the_schema_scoped_probe_for_partial_storage(
+    monkeypatch,
+) -> None:
+    """A table without its indexes still takes the create path, which keeps the manifest."""
+    session = FakeSession(table_exists=True, dimensions=4)
+    _install_session(monkeypatch, session)
+    original_execute = session.execute
+
+    async def missing_indexes(statement: object, params: dict[str, object] | None = None):
+        result = await original_execute(statement, params)
+        if "AS has_indexes" in str(statement):
+            result._rows[0]["has_indexes"] = False
+        return result
+
+    monkeypatch.setattr(session, "execute", missing_indexes)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.create_storage()
+
+    sql_calls = _sql_calls(session)
+    assert any("USING hnsw" in sql for sql in sql_calls)
+    assert not any("DROP TABLE IF EXISTS search_vector_embeddings" in sql for sql in sql_calls)
+    assert not any("embedding_status = 'pending'" in sql for sql in sql_calls)
+    probes = [sql for sql in sql_calls if "AS has_indexes" in sql]
+    assert probes and all("current_schema()::regnamespace" in probe for probe in probes)
+
+
+@pytest.mark.asyncio
+async def test_create_storage_rebuilds_dimension_mismatch_and_invalidates_manifest(
+    monkeypatch,
+) -> None:
+    session = FakeSession(table_exists=True, dimensions=8)
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.create_storage()
+
+    sql_calls = _sql_calls(session)
+    assert any("DROP TABLE IF EXISTS search_vector_embeddings" in sql for sql in sql_calls)
+    assert any("embedding_status = 'pending'" in sql for sql in sql_calls)
+
+
+@pytest.mark.asyncio
+async def test_create_storage_rebuilds_storage_without_source_generation(monkeypatch) -> None:
+    session = FakeSession(table_exists=True, dimensions=4, has_source_hash=False)
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.create_storage()
+
+    sql_calls = _sql_calls(session)
+    assert any("DROP TABLE IF EXISTS search_vector_embeddings" in sql for sql in sql_calls)
+    assert any("source_hash TEXT NOT NULL" in sql for sql in sql_calls)
+    assert any("embedding_status = 'pending'" in sql for sql in sql_calls)
+
+
+@pytest.mark.asyncio
+async def test_create_storage_reports_missing_pgvector_extension(monkeypatch) -> None:
+    session = FakeSession(extension_available=False)
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    with pytest.raises(SemanticDependenciesMissingError, match="pgvector extension"):
+        await index.create_storage()
+
+
+@pytest.mark.asyncio
+async def test_upsert_resolves_stable_keys_and_writes_one_batch(monkeypatch) -> None:
+    key_a = VectorKey(entity_id=11, chunk_key="entity:11:0")
+    key_b = VectorKey(entity_id=11, chunk_key="entity:11:1")
+    session = FakeSession(
+        chunk_rows=[
+            {
+                "id": 101,
+                "entity_id": 11,
+                "chunk_key": key_a.chunk_key,
+                "source_hash": "hash-a",
+            },
+            {
+                "id": 102,
+                "entity_id": 11,
+                "chunk_key": key_b.chunk_key,
+                "source_hash": "hash-b",
+            },
+        ]
+    )
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.upsert(
+        PROJECT,
+        [
+            VectorRecord(key=key_a, source_hash="hash-a", values=(1.0, 0.0, 0.0, 0.0)),
+            VectorRecord(key=key_b, source_hash="hash-b", values=(0.0, 1.0, 0.0, 0.0)),
+        ],
+    )
+
+    insert_call = next(call for call in session.calls if "INSERT INTO" in call[0])
+    assert insert_call[1] == {
+        "project_id": 7,
+        "chunk_id_0": 101,
+        "embedding_0": "[1,0,0,0]",
+        "dimensions_0": 4,
+        "source_hash_0": "hash-a",
+        "chunk_id_1": 102,
+        "embedding_1": "[0,1,0,0]",
+        "dimensions_1": 4,
+        "source_hash_1": "hash-b",
+    }
+    assert session.commit_count == 1
+    _assert_no_ddl(session)
+
+
+@pytest.mark.asyncio
+async def test_upsert_skips_stale_source_generation(monkeypatch) -> None:
+    key = VectorKey(entity_id=11, chunk_key="entity:11:0")
+    session = FakeSession(
+        chunk_rows=[
+            {
+                "id": 101,
+                "entity_id": 11,
+                "chunk_key": key.chunk_key,
+                "source_hash": "new-hash",
+            }
+        ]
+    )
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.upsert(
+        PROJECT, [VectorRecord(key=key, source_hash="old-hash", values=(1.0, 0.0, 0.0, 0.0))]
+    )
+
+    lock_call = next(call for call in session.calls if "SELECT id, entity_id" in call[0])
+    assert "FOR UPDATE" in lock_call[0]
+    assert not any("INSERT INTO" in sql for sql, _params in session.calls)
+    assert session.commit_count == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_rejects_missing_manifest_key(monkeypatch) -> None:
+    key = VectorKey(entity_id=12, chunk_key="entity:12:0")
+    session = FakeSession()
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    with pytest.raises(RuntimeError, match="manifest rows are missing"):
+        await index.upsert(
+            PROJECT, [VectorRecord(key=key, source_hash="hash", values=(1.0, 0.0, 0.0, 0.0))]
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_stable_keys_and_entity(monkeypatch) -> None:
+    key = VectorKey(entity_id=13, chunk_key="entity:13:0")
+    session = FakeSession(chunk_rows=[{"id": 103, "entity_id": 13, "chunk_key": key.chunk_key}])
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.delete(PROJECT, [])
+    await index.delete(PROJECT, [VectorDeletion(key=key, source_hash="hash")])
+    await index.delete_entity(PROJECT, 13)
+    await index.delete_orphans(PROJECT, [key])
+
+    delete_lock = next(call for call in session.calls if "SELECT id, entity_id" in call[0])
+    assert "source_hash = :source_hash_0" in delete_lock[0]
+    assert "embedding_status = 'pending'" in delete_lock[0]
+    assert "FOR UPDATE" in delete_lock[0]
+    delete_calls = [call for call in session.calls if "DELETE FROM" in call[0]]
+    assert len(delete_calls) == 4
+    assert delete_calls[0][1] == {"chunk_id_0": 103}
+    assert delete_calls[1][1] == {"chunk_id_0": 103}
+    assert delete_calls[2][1] == {"project_id": 7, "entity_id": 13}
+    assert delete_calls[3][1] == {
+        "project_id": 7,
+        "embedding_identity": "stub:4",
+    }
+    assert session.commit_count == 3
+    _assert_no_ddl(session)
+
+
+@pytest.mark.asyncio
+async def test_search_returns_normalized_stable_matches(monkeypatch) -> None:
+    session = FakeSession(
+        search_rows=[
+            {"entity_id": 14, "chunk_key": "entity:14:0", "similarity": 1.4},
+            {"entity_id": 15, "chunk_key": "entity:15:0", "similarity": -0.2},
+        ]
+    )
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    assert await index.search([], limit=5, projects=PROJECTS) == []
+    assert await index.search([1.0, 0.0, 0.0, 0.0], limit=0, projects=PROJECTS) == []
+    assert await index.search([1.0, 0.0, 0.0, 0.0], limit=5, projects=ProjectScope.of([])) == []
+    with pytest.raises(ValueError, match="expected 4, got 2"):
+        await index.search([1.0, 0.0], limit=5, projects=PROJECTS)
+    assert session.calls == []
+
+    matches = await index.search([1.0, 0.0, 0.0, 0.0], limit=5, projects=PROJECTS)
+
+    assert [(match.key.entity_id, match.similarity) for match in matches] == [
+        (14, 1.0),
+        (15, 0.0),
+    ]
+    search_call = next(call for call in session.calls if "AS similarity" in call[0])
+    assert "ORDER BY distance ASC, entity_id ASC, chunk_key ASC" in search_call[0]
+    assert search_call[1] == {
+        "query": "[1,0,0,0]",
+        "scope_0": 7,
+        "dimensions": 4,
+        "embedding_identity": "stub:4",
+        "chunk_scan": 5,
+        "limit": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_binds_every_project_in_scope(monkeypatch) -> None:
+    """A multi-project scope filters both the embedding and manifest rows by the same ids."""
+    session = FakeSession(search_rows=[])
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.search([1.0, 0.0, 0.0, 0.0], limit=5, projects=ProjectScope.of([9, 7]))
+
+    sql, params = next(call for call in session.calls if "AS similarity" in call[0])
+    assert params is not None
+    assert "WHERE e.project_id IN (:scope_0, :scope_1)" in sql
+    assert "AND c.project_id IN (:scope_0, :scope_1)" in sql
+    assert params["scope_0"] == 7
+    assert params["scope_1"] == 9
+
+
+def _settings(session: FakeSession) -> list[tuple[str, dict[str, object] | None]]:
+    return [call for call in session.calls if "set_config" in call[0]]
+
+
+@pytest.mark.parametrize(
+    ("extversion", "expected"),
+    [("0.7.4", False), ("0.8.0", True), ("0.8.1", True), ("1.0.0", True), ("garbage", False)],
+)
+def test_iterative_scan_arrived_in_pgvector_0_8(extversion: str, expected: bool) -> None:
+    assert pgvector_supports_iterative_scan(extversion) is expected
+
+
+def test_ef_search_is_sized_to_the_window_within_the_server_bounds() -> None:
+    assert hnsw_ef_search_for(5) == 40
+    assert hnsw_ef_search_for(40) == 40
+    assert hnsw_ef_search_for(250) == 250
+    assert hnsw_ef_search_for(5000) == 1000
+
+
+@pytest.mark.asyncio
+async def test_create_storage_requires_a_pgvector_that_can_keep_scanning(monkeypatch) -> None:
+    """An extension too old to fill a filtered window is a deployment error, not a quiet gap."""
+    older = FakeSession(pgvector_version="0.7.4")
+    _install_session(monkeypatch, older)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    with pytest.raises(SemanticDependenciesMissingError, match="pgvector 0.7.4 predates"):
+        await index.create_storage()
+
+    assert not any("CREATE TABLE" in sql for sql in _sql_calls(older))
+
+
+@pytest.mark.asyncio
+async def test_search_sizes_the_scan_to_the_window_it_must_fill(monkeypatch) -> None:
+    """A 250-row candidate window asks HNSW for 250 candidates, not the default 40."""
+    session = FakeSession(search_rows=[])
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.search([1.0, 0.0, 0.0, 0.0], limit=250, projects=PROJECTS)
+
+    ef_search = next(call for call in _settings(session) if "hnsw.ef_search" in call[0])
+    assert "set_config('hnsw.ef_search', :ef_search, true)" in ef_search[0]
+    assert ef_search[1] == {"ef_search": "250"}
+    search_sql = next(sql for sql, _params in session.calls if "AS similarity" in sql)
+    # The window is taken by distance inside the CTE, then re-sorted with tie-breaks.
+    assert "ORDER BY e.embedding <=> CAST(:query AS vector) LIMIT :chunk_scan" in search_sql
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_scanning_until_the_window_fills(monkeypatch) -> None:
+    session = FakeSession(search_rows=[])
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    await index.search([1.0, 0.0, 0.0, 0.0], limit=5, projects=PROJECTS)
+
+    settings = [sql for sql, _params in _settings(session)]
+    assert any("'hnsw.ef_search'" in sql for sql in settings)
+    assert any("'hnsw.iterative_scan', 'relaxed_order', true" in sql for sql in settings)
+    # Settings precede the scan they configure, inside the same session.
+    ordered = [sql for sql, _params in session.calls]
+    assert max(ordered.index(sql) for sql in settings) < next(
+        position for position, sql in enumerate(ordered) if "AS similarity" in sql
+    )
+
+
+ENTITY_ADMISSION = VectorAdmission(predicate="c.source_type = :kind", params={"kind": "entity"})
+
+
+@pytest.mark.asyncio
+async def test_search_rows_ranks_few_admitted_chunks_exactly_and_collapses_them(monkeypatch):
+    """Few admitted chunks are ranked exactly, then collapsed to rows in the same query."""
+    session = FakeSession(
+        admitted_chunks=12,
+        row_matches=[
+            {
+                "entity_id": 3,
+                "chunk_key": "entity:3:0",
+                "project_id": PROJECT,
+                "source_type": "entity",
+                "source_row_id": 30,
+                "distance": -0.1,
+                "chunks_scanned": 12,
+            },
+            {
+                "entity_id": 4,
+                "chunk_key": "entity:4:2",
+                "project_id": PROJECT,
+                "source_type": "entity",
+                "source_row_id": 40,
+                "distance": 1.4,
+                "chunks_scanned": 12,
+            },
+        ],
+    )
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    nothing = VectorRowSearch(matches=[], truncated=False)
+    assert await index.search_rows([], limit=2, chunk_scan=20, projects=PROJECTS) == nothing
+    assert (
+        await index.search_rows([1.0, 0, 0, 0], limit=0, chunk_scan=20, projects=PROJECTS)
+        == nothing
+    )
+    assert session.calls == []
+
+    search = await index.search_rows(
+        [1.0, 0.0, 0.0, 0.0],
+        limit=2,
+        chunk_scan=20,
+        projects=PROJECTS,
+        admission=ENTITY_ADMISSION,
+        chunks_per_row=3,
+    )
+    matches = search.matches
+
+    # An exact ranking read every admitted chunk, so nothing was cut off.
+    assert not search.truncated
+    assert [(m.source_type, m.source_row_id, m.key.chunk_key) for m in matches] == [
+        ("entity", 30, "entity:3:0"),
+        ("entity", 40, "entity:4:2"),
+    ]
+    # Similarity is clamped to [0, 1] like every other match.
+    assert [m.similarity for m in matches] == [1.0, 0.0]
+    assert _settings(session) == []
+    rows_sql, rows_params = next(call for call in session.calls if "chunk_rank" in call[0])
+    assert "LIMIT :chunk_scan" not in rows_sql
+    assert "AND c.source_type = :kind" in rows_sql
+    assert rows_params is not None
+    assert rows_params["row_limit"] == 2
+    assert rows_params["chunks_per_row"] == 3
+    assert rows_params["kind"] == "entity"
+
+
+@pytest.mark.asyncio
+async def test_search_rows_scans_hnsw_when_many_chunks_are_admitted(monkeypatch):
+    """Past the exact limit the scan reads ``chunk_scan`` chunks through HNSW, sorts off."""
+    session = FakeSession(
+        admitted_chunks=EXACT_ADMISSION_CHUNK_LIMIT + 1,
+        row_matches=[
+            {
+                "entity_id": 3,
+                "chunk_key": "entity:3:0",
+                "project_id": PROJECT,
+                "source_type": "entity",
+                "source_row_id": 30,
+                "distance": 0.2,
+                "chunks_scanned": 300,
+            }
+        ],
+    )
+    _install_session(monkeypatch, session)
+    index = PgVectorIndex(MagicMock(), _scope())
+
+    search = await index.search_rows(
+        [1.0, 0.0, 0.0, 0.0],
+        limit=10,
+        chunk_scan=300,
+        projects=PROJECTS,
+        admission=ENTITY_ADMISSION,
+    )
+
+    settings = _settings(session)
+    assert ("SELECT set_config('hnsw.ef_search', :ef_search, true)", {"ef_search": "300"}) in [
+        (sql, params) for sql, params in settings
+    ]
+    assert any("'enable_sort', 'off'" in sql for sql, _params in settings)
+    rows_sql = next(sql for sql, _params in session.calls if "chunk_rank" in sql)
+    assert "LIMIT :chunk_scan" in rows_sql
+    # The scan read all 300 chunks it was allowed, so more rows may sit past it.
+    assert search.truncated

@@ -1,0 +1,35 @@
+name: "Pull Request Title"
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    steps:
+      # Squash merges make the PR title the commit subject, so the type keeps
+      # main's history readable. The scope is free text: nothing reads it, and
+      # a fixed list only blocked PRs for areas it did not name yet.
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+          requireScope: false

@@ -1,0 +1,85 @@
+import { Type } from "@sinclair/typebox"
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry"
+import {
+  type BmClient,
+  describeToolError,
+  type WorkspaceResult,
+} from "../bm-client.ts"
+import { log } from "../logger.ts"
+
+function formatWorkspace(ws: WorkspaceResult, idx: number): string {
+  return (
+    `${idx + 1}. **${ws.name}**\n` +
+    `   Type: ${ws.workspace_type ?? "unknown"}`
+  )
+}
+
+export function registerWorkspaceListTool(
+  api: OpenClawPluginApi,
+  client: BmClient,
+): void {
+  api.registerTool(
+    {
+      name: "list_workspaces",
+      label: "List Workspaces",
+      description:
+        "List workspaces represented by accessible Basic Memory projects. " +
+        "Use it to find the workspace to pass to list_memory_projects when the same " +
+        "project name may exist in more than one workspace.",
+      parameters: Type.Object({}),
+      async execute(_toolCallId: string, _params: Record<string, never>) {
+        log.debug("list_workspaces")
+
+        try {
+          const workspaces = await client.listWorkspaces()
+
+          if (workspaces.length === 0) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "No workspaces found.",
+                },
+              ],
+              details: {
+                count: 0,
+                workspaces: [],
+              },
+            }
+          }
+
+          const text = workspaces.map(formatWorkspace).join("\n\n")
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Found ${workspaces.length} workspace(s):\n\n${text}`,
+              },
+            ],
+            details: {
+              count: workspaces.length,
+              workspaces,
+            },
+          }
+        } catch (err) {
+          log.error("list_workspaces failed", err)
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Failed to list workspaces: ${describeToolError(err)}`,
+              },
+            ],
+            details: {
+              count: 0,
+              workspaces: [],
+              error: "list_workspaces_failed",
+            },
+          }
+        }
+      },
+    },
+    { name: "list_workspaces" },
+  )
+}

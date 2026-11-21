@@ -1,0 +1,140 @@
+"""Exercise line reads and line-match search through real project-scoped API clients."""
+
+import json
+
+import pytest
+from fastmcp import Client, FastMCP
+from fastmcp.exceptions import ToolError
+
+from basic_memory.mcp.clients import KnowledgeClient
+from basic_memory.mcp.tools import bm_read, bm_search, bm_write
+from basic_memory.schemas.v2 import EntityResponseV2
+
+
+@pytest.mark.asyncio
+async def test_scan_read_round_trip_and_token_savings(client, test_project) -> None:
+    body = "\n".join(
+        "retry the operation" if n in (70, 72, 180) else f"Background line {n}: " + "detail " * 15
+        for n in range(200)
+    )
+    await bm_write(title="Scan Note", directory="test", content=body, project=test_project.name)
+    full = await bm_read("Scan Note", output_format="json", project=test_project.name)
+    assert isinstance(full, dict)
+    lines = full["content"].splitlines()
+    expected_matches = [n for n, line in enumerate(lines, 1) if "retry" in line]
+
+    result = await bm_search(
+        "retry",
+        mode="text",
+        lines=1,
+        max_matches=2,
+        output_format="json",
+        project=test_project.name,
+    )
+    ordinary = await bm_search(
+        "retry", mode="text", output_format="json", project=test_project.name
+    )
+    assert isinstance(result, dict)
+    assert len(json.dumps(result)) < len(json.dumps(ordinary)) / 2
+    row = result["results"][0]
+    assert "content" not in row and "matched_chunk" not in row and "frontmatter" not in row
+    assert row["match_count"] == 3
+    assert row["next_match_line"] == expected_matches[2]
+    assert len(row["windows"]) == 1
+    window = row["windows"][0]
+    assert window["match_lines"] == expected_matches[:2]
+
+    sliced = await bm_read(
+        row["external_id"],
+        start_line=window["start_line"],
+        end_line=window["end_line"],
+        output_format="json",
+        project=test_project.name,
+    )
+    assert isinstance(sliced, dict)
+    assert sliced["content"] == window["content"]
+    assert sliced["total_lines"] == len(lines)
+    assert sliced["has_more"] is True
+    assert sliced["next_start_line"] == window["end_line"] + 1
+    assert sliced["next_end_line"] == window["end_line"] + len(window["content"].splitlines())
+    assert sliced["frontmatter"] is None
+    assert len(json.dumps(sliced)) < len(json.dumps(full)) / 10
+
+    numbered = await bm_read(
+        "Scan Note",
+        start_line=expected_matches[0],
+        end_line=expected_matches[0],
+        project=test_project.name,
+    )
+    assert isinstance(numbered, str)
+    assert f"{expected_matches[0]}: retry the operation" in numbered
+    assert "next: start_line=" in numbered
+
+
+@pytest.mark.asyncio
+async def test_ranges_include_frontmatter_and_have_eof_metadata(client, test_project) -> None:
+    await bm_write(
+        title="Bounds", directory="test", content="alpha\nbeta", project=test_project.name
+    )
+    full = await bm_read("Bounds", output_format="json", project=test_project.name)
+    assert isinstance(full, dict)
+    lines = full["content"].splitlines()
+    opening = await bm_read("Bounds", end_line=2, output_format="json", project=test_project.name)
+    assert isinstance(opening, dict)
+    assert opening["content"] == "\n".join(lines[:2])
+    assert opening["start_line"] == 1
+    for end in (None, len(lines) + 100):
+        last = await bm_read(
+            "Bounds",
+            start_line=len(lines),
+            end_line=end,
+            output_format="json",
+            project=test_project.name,
+        )
+        assert isinstance(last, dict)
+        assert last["content"] == lines[-1]
+        assert last["has_more"] is False
+        assert last["next_start_line"] is None and last["next_end_line"] is None
+    # A range past the last line is an error, not an empty "Lines 1000-N" read (#1634).
+    with pytest.raises(ToolError, match="start_line 1000 is past the end of the document"):
+        await bm_read("Bounds", start_line=1000, output_format="json", project=test_project.name)
+
+
+@pytest.mark.asyncio
+async def test_exact_uuid_line_read_is_one_sliced_get(client, test_project, monkeypatch) -> None:
+    await bm_write(title="One Get", directory="test", content="alpha", project=test_project.name)
+    found = await bm_search("alpha", mode="text", output_format="json", project=test_project.name)
+    assert isinstance(found, dict)
+    identifier = found["results"][0]["external_id"]
+    original = KnowledgeClient.get_entity
+    calls: list[tuple[str, str | None]] = []
+
+    async def record(
+        self: KnowledgeClient,
+        entity_id: str,
+        *,
+        section: str | None = None,
+        lines: str | None = None,
+        max_tokens: int | None = None,
+    ) -> EntityResponseV2:
+        calls.append((entity_id, lines))
+        return await original(self, entity_id, section=section, lines=lines, max_tokens=max_tokens)
+
+    monkeypatch.setattr(KnowledgeClient, "get_entity", record)
+    await bm_read(identifier, end_line=2, project=test_project.name)
+    assert calls == [(identifier, "1-2")]
+
+
+@pytest.mark.parametrize(
+    "bounds", [{"start_line": 0}, {"end_line": 0}, {"start_line": 5, "end_line": 3}]
+)
+@pytest.mark.asyncio
+async def test_invalid_read_bounds_fail_before_routing(bounds: dict[str, int]) -> None:
+    # No app or database: the call must fail at validation, before any routing.
+    server = FastMCP("read-bounds")
+    server.tool(bm_read)
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "bm_read", {"identifier": "any", "project": "any", **bounds}, raise_on_error=False
+        )
+    assert result.is_error

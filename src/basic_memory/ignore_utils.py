@@ -1,0 +1,411 @@
+"""Utilities for handling .gitignore patterns and file filtering."""
+
+import fnmatch
+import re
+from functools import lru_cache
+from pathlib import Path
+from typing import Set
+
+from pathspec import GitIgnoreSpec
+from pathspec.patterns.gitignore.base import GitIgnorePatternError
+from pathspec.patterns.gitignore.spec import GitIgnoreSpecPattern
+
+from basic_memory.config import resolve_data_dir
+
+
+# Marker shared by the API ignored-path rejection detail and MCP-side error handling.
+# The index-file endpoint embeds it in its 400 detail and edit_note's disk recovery
+# matches on it, so "exists but ignored" stays distinguishable from generic rejections
+# without duplicating message text across layers.
+IGNORED_PATH_REJECTION_DETAIL = (
+    "matches Basic Memory ignore rules (.bmignore or project .gitignore)"
+)
+
+
+# Common directories and patterns to ignore by default
+# These are used as fallback if .bmignore doesn't exist
+DEFAULT_IGNORE_PATTERNS = {
+    # Hidden files (files starting with dot)
+    ".*",
+    # Basic Memory internal files
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "config.json",
+    # Version control
+    ".git",
+    ".svn",
+    # Python
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    ".pytest_cache",
+    ".coverage",
+    "*.egg-info",
+    ".tox",
+    ".mypy_cache",
+    ".ruff_cache",
+    # Virtual environments
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    # Node.js
+    "node_modules",
+    # Build artifacts
+    "build",
+    "dist",
+    ".cache",
+    # IDE
+    ".idea",
+    ".vscode",
+    # OS files
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    # Obsidian
+    ".obsidian",
+    # Temporary files
+    "*.tmp",
+    "*.swp",
+    "*.swo",
+    "*~",
+}
+
+
+def _parse_ignore_pattern_line(raw_line: str) -> str | None:
+    """Return the pattern for one gitignore-style line, or None to skip it.
+
+    Blank lines and comments (leading ``#``) are skipped. A leading backslash
+    escapes a pattern that itself begins with ``#`` (gitignore rule), so
+    ``\\#*#`` yields the pattern ``#*#``.
+    """
+    line = raw_line.rstrip("\r\n")
+    if not line or line.startswith("#"):
+        return None
+    # Directory rules are compiled by pathspec, which needs their original escapes.
+    if line.rstrip(" ").endswith("/"):
+        return line.rstrip(" ")
+    # fnmatch has no backslash escapes. Decode literal hashes, spaces, and
+    # backslashes together so escaped trailing spaces survive, while unescaped
+    # trailing spaces are discarded without changing significant leading ones.
+    return re.sub(r"\\([\\ #])| +$", lambda match: match[1] or "", line) or None
+
+
+def get_bmignore_path() -> Path:
+    """Get path to .bmignore file.
+
+    Returns:
+        Path to <basic-memory data dir>/.bmignore, honoring
+        ``BASIC_MEMORY_CONFIG_DIR`` so isolated instances each keep their
+        own ignore file.
+    """
+    return resolve_data_dir() / ".bmignore"
+
+
+def create_default_bmignore() -> None:
+    """Create default .bmignore file if it doesn't exist.
+
+    This ensures users have a file they can customize for all Basic Memory operations.
+    """
+    bmignore_path = get_bmignore_path()
+
+    if bmignore_path.exists():
+        return
+
+    bmignore_path.parent.mkdir(parents=True, exist_ok=True)
+    bmignore_path.write_text("""# Basic Memory Ignore Patterns
+# This file is used by 'bm cloud upload', 'bm cloud push'/'pull', the deprecated
+# 'bm cloud bisync', and file indexing
+# Patterns use standard gitignore-style syntax
+
+# Hidden files (files starting with dot)
+.*
+
+# Basic Memory internal files (includes test databases)
+*.db
+*.db-shm
+*.db-wal
+config.json
+
+# Version control
+.git
+.svn
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+*.egg-info
+.tox
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+.env
+
+# Node.js
+node_modules
+
+# Build artifacts
+build
+dist
+.cache
+
+# IDE
+.idea
+.vscode
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Obsidian
+.obsidian
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+""")
+
+
+def load_bmignore_patterns() -> Set[str]:
+    """Load patterns from .bmignore file.
+
+    Returns:
+        Set of patterns from .bmignore, or DEFAULT_IGNORE_PATTERNS if file doesn't exist
+    """
+    bmignore_path = get_bmignore_path()
+
+    # Create default file if it doesn't exist
+    if not bmignore_path.exists():
+        create_default_bmignore()
+
+    patterns = set()
+
+    try:
+        with bmignore_path.open("r", encoding="utf-8-sig") as f:
+            for line in f:
+                pattern = _parse_ignore_pattern_line(line)
+                if pattern:
+                    patterns.add(pattern)
+    except Exception:  # pragma: no cover
+        # If we can't read .bmignore, fall back to defaults
+        return set(DEFAULT_IGNORE_PATTERNS)  # pragma: no cover
+
+    # If no patterns were loaded, use defaults
+    if not patterns:  # pragma: no cover
+        return set(DEFAULT_IGNORE_PATTERNS)  # pragma: no cover
+
+    return patterns
+
+
+def load_gitignore_patterns(
+    base_path: Path, use_gitignore: bool = True, *, strict: bool = False
+) -> Set[str]:
+    """Load gitignore patterns from .gitignore file and .bmignore.
+
+    Combines patterns from:
+    1. <basic-memory data dir>/.bmignore (user's global ignore patterns, honors
+       BASIC_MEMORY_CONFIG_DIR)
+    2. {base_path}/.gitignore (project-specific patterns, if use_gitignore=True)
+
+    Args:
+        base_path: The base directory to search for .gitignore file
+        use_gitignore: If False, only load patterns from .bmignore (default: True)
+        strict: Read without creating files; only missing ignore files permit defaults.
+
+    Returns:
+        Set of patterns to ignore
+    """
+    if strict:
+        # Publishing a snapshot must never silently include files excluded by unreadable rules.
+        patterns: set[str] = set()
+        bmignore_path = get_bmignore_path()
+        paths = [bmignore_path, base_path / ".gitignore"] if use_gitignore else [bmignore_path]
+        for path in paths:
+            try:
+                content = path.read_text(encoding="utf-8-sig")
+            except FileNotFoundError:
+                content = ""
+            patterns.update(
+                pattern
+                for line in content.splitlines()
+                if (pattern := _parse_ignore_pattern_line(line)) is not None
+            )
+            if path == bmignore_path and not patterns:
+                patterns.update(DEFAULT_IGNORE_PATTERNS)
+        return patterns
+
+    # Start with patterns from .bmignore
+    patterns = load_bmignore_patterns()
+
+    if use_gitignore:
+        gitignore_file = base_path / ".gitignore"
+        if gitignore_file.exists():
+            try:
+                with gitignore_file.open("r", encoding="utf-8-sig") as f:
+                    for line in f:
+                        pattern = _parse_ignore_pattern_line(line)
+                        if pattern:
+                            patterns.add(pattern)
+            except Exception:
+                # If we can't read .gitignore, just use default patterns
+                pass
+
+    return patterns
+
+
+@lru_cache(maxsize=32)
+def _gitignore_rules(patterns: frozenset[str]) -> GitIgnoreSpec:
+    """Compile an ignore set with Git's semantics, once, so large sets cannot churn a cache."""
+    compiled_patterns: list[GitIgnoreSpecPattern] = []
+    for pattern in patterns:
+        components = pattern.split("/")
+        # A trailing-slash rule's last real component sits before the empty final one.
+        terminal_directory_index = len(components) - 2 if pattern.endswith("/") else None
+        for index, component in enumerate(components):
+            if len(component) >= 2 and not component.strip("*"):
+                # Git accepts longer all-star components. A terminal directory globstar
+                # must consume a directory; pathspec otherwise also matches direct files.
+                # An interior globstar ("foo/**/bar") keeps matching zero or more segments.
+                components[index] = "*" if index == terminal_directory_index else "**"
+        normalized = "/".join(components)
+        # Rule collections are unordered exclusion sets; adding ordered negation is a
+        # separate compatibility change. Preserve literal leading ! and decoded # names.
+        if normalized.startswith(("!", "#")):
+            normalized = "\\" + normalized
+        try:
+            compiled_patterns.append(GitIgnoreSpecPattern(normalized))
+        except (GitIgnorePatternError, re.error):
+            # Git tolerates unusable lines; one must not disable valid exclusions.
+            continue
+    return GitIgnoreSpec(compiled_patterns, backend="simple")
+
+
+def _gitignore_escaped(decoded_pattern: str) -> str:
+    r"""Re-escape a decoded rule so pathspec reads its backslashes and spaces literally.
+
+    The line parser decodes `\\`, `\ ` and `\#` for fnmatch, which has no escapes;
+    pathspec does, so a literal backslash or trailing space must be escaped again.
+    """
+    escaped = decoded_pattern.replace("\\", "\\\\")
+    stripped = escaped.rstrip(" ")
+    return stripped + "\\ " * (len(escaped) - len(stripped))
+
+
+def should_ignore_path(
+    file_path: Path,
+    base_path: Path,
+    ignore_patterns: Set[str],
+    *,
+    is_directory: bool | None = None,
+) -> bool:
+    """Check if a file path should be ignored based on gitignore patterns.
+
+    Args:
+        file_path: The file path to check
+        base_path: The base directory for relative path calculation
+        ignore_patterns: Set of patterns to match against
+        is_directory: Known entry kind for virtual paths; None inspects the local path.
+
+    Returns:
+        True if the path should be ignored, False otherwise
+    """
+    try:
+        relative_path = file_path.relative_to(base_path)
+    except ValueError:
+        # No project-relative spelling exists for a path outside this root.
+        return False
+
+    relative_str = str(relative_path)
+    relative_posix = relative_path.as_posix()  # Use forward slashes for matching
+    directory_patterns = frozenset(pattern for pattern in ignore_patterns if pattern.endswith("/"))
+    if directory_patterns:
+        # A trailing slash distinguishes directories being pruned from files.
+        # Remote and archive entries must not inherit a conflicting local entry's kind.
+        if is_directory is None:
+            is_directory = file_path.is_dir()
+        directory_match_path = relative_posix + ("/" if is_directory else "")
+        if _gitignore_rules(directory_patterns).match_file(directory_match_path):
+            return True
+
+    # Trigger: a rule with a slash but no trailing slash ("/archive", "drafts/old").
+    # Why: such a rule can name a directory, which excludes everything beneath it, as
+    #      in Git. Scans prune the directory before reaching its files; file-level
+    #      callers (prune planning, single-file indexing, ZIP import) must agree.
+    # Outcome: Git's own semantics decide, so a wildcard never crosses a "/" and an
+    #          anchored rule never matches a nested directory.
+    path_rules = frozenset(
+        _gitignore_escaped(pattern)
+        for pattern in ignore_patterns
+        if "/" in pattern and not pattern.endswith("/")
+    )
+    if path_rules and _gitignore_rules(path_rules).match_file(relative_posix):
+        return True
+
+    # Non-directory patterns retain their existing matching behavior.
+    for pattern in ignore_patterns:
+        if pattern.endswith("/"):
+            continue
+
+        # Handle patterns starting with / (root relative)
+        if pattern.startswith("/"):
+            root_pattern = pattern[1:]  # Remove leading /
+            if fnmatch.fnmatch(relative_posix, root_pattern):
+                return True
+            continue
+
+        # Direct name match (e.g., ".git", "node_modules")
+        if pattern in relative_path.parts:
+            return True
+
+        # Check if any individual path part matches the glob pattern
+        # This handles cases like ".*" matching ".hidden.md" in "concept/.hidden.md"
+        for part in relative_path.parts:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+
+        # Glob pattern match on full path
+        if fnmatch.fnmatch(relative_posix, pattern) or fnmatch.fnmatch(relative_str, pattern):
+            return True  # pragma: no cover
+
+    return False
+
+
+def filter_files(
+    files: list[Path], base_path: Path, ignore_patterns: Set[str] | None = None
+) -> tuple[list[Path], int]:
+    """Filter a list of files based on gitignore patterns.
+
+    Args:
+        files: List of file paths to filter
+        base_path: The base directory for relative path calculation
+        ignore_patterns: Set of patterns to ignore. If None, loads from .gitignore
+
+    Returns:
+        Tuple of (filtered_files, ignored_count)
+    """
+    if ignore_patterns is None:
+        ignore_patterns = load_gitignore_patterns(base_path)
+
+    filtered_files = []
+    ignored_count = 0
+
+    for file_path in files:
+        if should_ignore_path(file_path, base_path, ignore_patterns):
+            ignored_count += 1
+        else:
+            filtered_files.append(file_path)
+
+    return filtered_files, ignored_count

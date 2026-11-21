@@ -1,0 +1,631 @@
+"""
+Gated integration tests against a real basic-memory MCP server.
+
+These tests spin up the real `bm mcp` subprocess via the production actor and
+exercise every tool through `handle_tool_call`, mirroring the production code
+path. They are skipped unless BOTH:
+
+    BM_INTEGRATION=1
+    AND `bm` is installed AND `mcp` Python package is importable
+
+A throwaway BM project is created for the test session and removed afterward,
+so these tests never touch your real BM projects.
+
+Run them with:
+
+    BM_INTEGRATION=1 uv run --with pytest --with mcp pytest tests/test_integration.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+
+import pytest
+
+
+# ---- Gating ----
+
+_INTEGRATION_ENABLED = os.environ.get("BM_INTEGRATION") == "1"
+_BM_BIN = shutil.which("bm") or (
+    os.path.expanduser("~/.local/bin/bm")
+    if os.path.isfile(os.path.expanduser("~/.local/bin/bm"))
+    else None
+)
+
+try:
+    import mcp  # noqa: F401
+
+    _MCP_OK = True
+except Exception:
+    _MCP_OK = False
+
+pytestmark = [
+    pytest.mark.skipif(
+        not _INTEGRATION_ENABLED,
+        reason="set BM_INTEGRATION=1 to run integration tests",
+    ),
+    pytest.mark.skipif(_BM_BIN is None, reason="bm CLI not on PATH"),
+    pytest.mark.skipif(not _MCP_OK, reason="mcp Python package not installed"),
+]
+
+
+# ---- Session-scoped BM project ----
+
+
+@pytest.fixture(scope="session")
+def temp_bm_project():
+    """Create a throwaway BM project for the session; remove when done."""
+    project_name = f"hermes-bm-test-{uuid.uuid4().hex[:8]}"
+    project_dir = tempfile.mkdtemp(prefix=f"{project_name}-")
+    # Register
+    subprocess.run(
+        [_BM_BIN, "project", "add", project_name, project_dir],
+        check=False,
+        capture_output=True,
+        timeout=20,
+    )
+    yield project_name, project_dir
+    # Tear down
+    subprocess.run(
+        [_BM_BIN, "project", "remove", project_name],
+        check=False,
+        capture_output=True,
+        timeout=20,
+    )
+    shutil.rmtree(project_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def provider(bm, temp_bm_project, tmp_path):
+    """Initialized provider pointing at the temp project."""
+    project_name, project_dir = temp_bm_project
+    # Pre-write a config file in this test's hermes_home so initialize picks it up
+    cfg = {
+        "mode": "local",
+        "project": project_name,
+        "project_path": project_dir,
+        "capture_per_turn": True,
+        "capture_session_end": True,
+        "capture_folder": "test-sessions",
+    }
+    (tmp_path / "basic-memory.json").write_text(json.dumps(cfg))
+
+    p = bm.BasicMemoryProvider()
+    p.initialize(
+        session_id=f"integration-{uuid.uuid4().hex[:6]}",
+        hermes_home=str(tmp_path),
+        platform="cli",
+    )
+    if not p._initialized:
+        pytest.fail("Provider failed to initialize against the real bm MCP server")
+    yield p
+    p.shutdown()
+
+
+def _parse_tool_result(raw):
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    return d
+
+
+# ---- Actor smoke ----
+
+
+def test_actor_starts_and_lists_expected_tools(provider, bm):
+    tools = {t["name"] for t in provider._actor.list_tools()}
+    expected = set(bm._HERMES_TO_BM.values())
+    missing = expected - tools
+    assert not missing, f"BM MCP server missing tools we depend on: {missing}"
+
+
+# ---- Tool surface ----
+
+
+def test_bm_write_returns_full_permalink(provider, bm):
+    title = f"Integration Write Test {uuid.uuid4().hex[:6]}"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\n\nbody.\n",
+            "folder": "tests",
+            "tags": ["integration"],
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    assert permalink, f"no permalink extracted from: {raw[:300]}"
+    # BM permalinks include the project prefix
+    assert permalink.split("/")[0] == provider._project, (
+        f"permalink should start with project name: {permalink}"
+    )
+
+
+def test_bm_read_round_trips_a_written_note(provider, bm):
+    title = f"Read RT {uuid.uuid4().hex[:6]}"
+    body = f"# {title}\n\nMARKER-{uuid.uuid4().hex}\n"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": body,
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    raw = provider.handle_tool_call("bm_read", {"identifier": permalink})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert title in text
+
+
+def test_bm_edit_append_lands_in_note(provider, bm):
+    title = f"Append Test {uuid.uuid4().hex[:6]}"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\nseed\n",
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    marker = f"APPEND-MARKER-{uuid.uuid4().hex}"
+    provider.handle_tool_call(
+        "bm_edit",
+        {
+            "identifier": permalink,
+            "operation": "append",
+            "content": f"\n{marker}\n",
+        },
+    )
+    raw = provider.handle_tool_call("bm_read", {"identifier": permalink})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert marker in text
+
+
+def test_bm_edit_replace_section_swaps_content(provider, bm):
+    title = f"ReplaceSection {uuid.uuid4().hex[:6]}"
+    body = f"# {title}\n\n## Notes\noriginal-body\n"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": body,
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    new_marker = f"REPLACED-{uuid.uuid4().hex}"
+    provider.handle_tool_call(
+        "bm_edit",
+        {
+            "identifier": permalink,
+            "operation": "replace_section",
+            "section": "## Notes",
+            "content": new_marker,
+        },
+    )
+    raw = provider.handle_tool_call("bm_read", {"identifier": permalink})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert new_marker in text
+    assert "original-body" not in text
+
+
+def test_bm_search_finds_a_freshly_written_note(provider, bm):
+    unique = f"SEARCH-MARKER-{uuid.uuid4().hex}"
+    title = f"Search Test {unique}"
+    provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\nbody.\n",
+            "folder": "tests",
+        },
+    )
+    raw = provider.handle_tool_call("bm_search", {"query": unique, "limit": 5})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert unique in text or title in text
+
+
+def test_bm_context_returns_results(provider, bm):
+    title = f"Context Test {uuid.uuid4().hex[:6]}"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\n",
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    raw = provider.handle_tool_call(
+        "bm_context",
+        {
+            "url": f"memory://{permalink}",
+            "depth": 1,
+        },
+    )
+    d = _parse_tool_result(raw)
+    assert d is not None
+    # build_context returns a JSON dict with `results` (and other fields)
+    text_blob = json.dumps(d)
+    assert "results" in text_blob
+
+
+def test_bm_move_relocates_note(provider, bm):
+    """
+    BM permalinks are stable IDs that don't change on move — only the
+    file_path moves. So we verify by:
+    1. The move response itself reports the new destination
+    2. Reading by the original permalink still succeeds (note wasn't lost)
+    """
+    title = f"Move Test {uuid.uuid4().hex[:6]}"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\n",
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    assert permalink, "expected a permalink from bm_write"
+
+    raw = provider.handle_tool_call(
+        "bm_move",
+        {
+            "identifier": permalink,
+            "new_folder": "tests/archive",
+        },
+    )
+    d = _parse_tool_result(raw)
+    move_text = (d or {}).get("text") or json.dumps(d or {})
+    # Move response text reports both the old and new locations
+    assert "moved successfully" in move_text.lower() or "moved" in move_text.lower(), (
+        f"move response missing success indicator: {move_text[:200]}"
+    )
+    assert "tests/archive" in move_text, f"move response missing new folder: {move_text[:200]}"
+
+    # Permalink is stable — reading by it should still work
+    raw = provider.handle_tool_call("bm_read", {"identifier": permalink})
+    d = _parse_tool_result(raw)
+    read_text = (d or {}).get("text") or json.dumps(d or {})
+    assert title in read_text, "note should still be readable after move"
+
+
+def test_bm_delete_removes_note(provider, bm):
+    title = f"Delete Test {uuid.uuid4().hex[:6]}"
+    raw = provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": title,
+            "content": f"# {title}\n",
+            "folder": "tests",
+        },
+    )
+    permalink = bm._extract_permalink(raw, "")
+    provider.handle_tool_call("bm_delete", {"identifier": permalink})
+    # Read should now indicate "not found"
+    raw = provider.handle_tool_call("bm_read", {"identifier": permalink})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    lowered = text.lower()
+    # basic-memory 1.0 reports NOT_FOUND; earlier releases said "not found".
+    assert any(m in lowered for m in ("not found", "not_found", "no notes found")), (
+        f"expected a 'not found' indication, got: {text[:200]}"
+    )
+
+
+def test_memory_quest_fields_round_trip(provider, bm):
+    """The Memory Quest Mission 8 flow: pick a project by external_id/source,
+    write with metadata and overwrite=false, refuse a duplicate, read the
+    checksum, and replace only that revision."""
+    project = next(
+        p
+        for p in json.loads(provider.handle_tool_call("bm_projects", {}))["projects"]
+        if p["name"] == provider._project
+    )
+    assert project["source"] == "local"
+    assert project["external_id"]
+    assert "qualified_name" in project
+
+    title = f"Memory Master {uuid.uuid4().hex[:6]}"
+    write_args = {
+        "title": title,
+        "content": "Memory Master body.",
+        "folder": "memory-quest",
+        "note_type": "memory_master",
+        "project_id": project["external_id"],
+        "metadata": {"memory_quest_code": "MQ-TEST-0001", "memory_quest_guidance": "active"},
+        "overwrite": False,
+    }
+    created = provider.handle_tool_call("bm_write", write_args)
+    permalink = bm._extract_permalink(created, "")
+    assert permalink, created
+
+    refused = json.loads(provider.handle_tool_call("bm_write", write_args))
+    assert "already exists" in refused["error"].lower()
+
+    def read_json():
+        return json.loads(
+            provider.handle_tool_call(
+                "bm_read",
+                {
+                    "identifier": permalink,
+                    "project_id": project["external_id"],
+                    "include_frontmatter": True,
+                    "output_format": "json",
+                },
+            )
+        )
+
+    note = read_json()
+    assert note["frontmatter"]["type"] == "memory_master"
+    assert note["frontmatter"]["memory_quest_code"] == "MQ-TEST-0001"
+    assert note["frontmatter"]["memory_quest_guidance"] == "active"
+    assert "memory_quest_code: MQ-TEST-0001" in note["content"]
+    checksum = note["checksum"]
+    assert checksum
+
+    stale = json.loads(
+        provider.handle_tool_call(
+            "bm_write",
+            dict(write_args, content="Stale.", overwrite=True, expected_checksum="0" * 64),
+        )
+    )
+    assert "REVISION_CONFLICT" in stale["error"]
+    assert checksum in stale["error"]
+    assert "Memory Master body." in read_json()["content"]
+
+    replaced = provider.handle_tool_call(
+        "bm_write",
+        dict(
+            write_args,
+            content="Replaced body.",
+            metadata={"memory_quest_code": "MQ-TEST-0002", "memory_quest_guidance": "active"},
+            overwrite=True,
+            expected_checksum=checksum,
+        ),
+    )
+    assert "error" not in json.loads(replaced), replaced
+    after = read_json()
+    assert "Replaced body." in after["content"]
+    assert after["frontmatter"]["memory_quest_code"] == "MQ-TEST-0002"
+    assert after["checksum"] != checksum
+
+
+# ---- Project registry authority (#2019) ----
+
+
+def _bm_data_dir() -> str:
+    """The directory bm resolves for its config, by bm's own rules."""
+    return (
+        os.environ.get("BASIC_MEMORY_CONFIG_DIR")
+        or (
+            os.path.join(os.environ["XDG_CONFIG_HOME"], "basic-memory")
+            if os.environ.get("XDG_CONFIG_HOME")
+            else None
+        )
+        or os.path.expanduser("~/.basic-memory")
+    )
+
+
+def _bm_lists(project_name: str) -> bool:
+    out = subprocess.run(
+        [_BM_BIN, "project", "list", "--local", "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return any(row.get("name") == project_name for row in json.loads(out.stdout)["projects"])
+
+
+def _start_provider(bm, home, cfg):
+    (home / "basic-memory.json").write_text(json.dumps(cfg))
+    p = bm.BasicMemoryProvider()
+    p.initialize(session_id=f"registry-{uuid.uuid4().hex[:6]}", hermes_home=str(home))
+    return p
+
+
+def test_project_registered_outside_the_legacy_config_initializes(
+    bm, temp_bm_project, monkeypatch, tmp_path
+):
+    """The setup behind #2019: bm keeps its registry in
+    BASIC_MEMORY_CONFIG_DIR, while a stale ~/.basic-memory/config.json lacks
+    the project. The plugin used to read only the stale file and refuse."""
+    project_name, project_dir = temp_bm_project
+    monkeypatch.setenv("BASIC_MEMORY_CONFIG_DIR", _bm_data_dir())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy = tmp_path / ".basic-memory" / "config.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({"projects": {"main": {"path": str(tmp_path / "main")}}}))
+
+    p = _start_provider(
+        bm, tmp_path, {"mode": "local", "project": project_name, "project_path": project_dir}
+    )
+    try:
+        assert p._initialized, bm._init_failures.get(bm._home_key(tmp_path))
+        raw = p.handle_tool_call("bm_search", {"query": "anything"})
+        assert "not initialized" not in raw
+    finally:
+        p.shutdown()
+
+
+def test_missing_local_project_is_created_once_then_reused(bm, monkeypatch, tmp_path):
+    project_name = f"hermes-bm-created-{uuid.uuid4().hex[:8]}"
+    project_dir = tmp_path / "notes"
+    cfg = {"mode": "local", "project": project_name, "project_path": str(project_dir)}
+    commands: list[str] = []
+    real_call = bm._BmMcpActor.call
+
+    def spy(self, tool_name, arguments, timeout=30.0):
+        if tool_name in ("bm_project_list", "bm_project_create"):
+            commands.append(tool_name.removeprefix("bm_project_"))
+        return real_call(self, tool_name, arguments, timeout=timeout)
+
+    monkeypatch.setattr(bm._BmMcpActor, "call", spy)
+    try:
+        first = _start_provider(bm, tmp_path, cfg)
+        first.shutdown()
+        assert first._project == project_name
+        assert commands == ["list", "create"]
+        assert _bm_lists(project_name)
+
+        commands.clear()
+        second = _start_provider(bm, tmp_path, cfg)
+        second.shutdown()
+        assert commands == ["list"], "an existing project must not be created again"
+    finally:
+        subprocess.run(
+            [_BM_BIN, "project", "remove", project_name],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+
+
+def test_unlisted_cloud_project_fails_with_a_clear_reason(bm, tmp_path):
+    project_name = f"hermes-bm-absent-{uuid.uuid4().hex[:8]}"
+    p = _start_provider(bm, tmp_path, {"mode": "cloud", "project": project_name})
+    assert not p._initialized and p._actor is None
+    reason = bm._init_failures[bm._home_key(tmp_path)]
+    assert f"project {project_name!r} is not in Basic Memory's project list" in reason
+    assert f"bm project add {project_name} --cloud" in reason
+
+
+# ---- Capture pipeline ----
+
+
+def test_sync_turn_writes_then_appends_to_same_session_note(provider, bm):
+    # First turn — creates the session note
+    provider.sync_turn("integration turn-1 user", "integration turn-1 assistant")
+    # sync_turn writes inline (Hermes v0.22 runs it on the manager's worker).
+    sid_1 = provider._session_note_id
+    assert sid_1, "first sync_turn should set _session_note_id"
+    assert sid_1.startswith(provider._project + "/"), (
+        f"session_note_id should include project prefix, got: {sid_1}"
+    )
+
+    # Second turn — should append to the same note
+    marker = f"TURN-2-MARKER-{uuid.uuid4().hex}"
+    provider.sync_turn("integration turn-2 user", marker)
+    # sync_turn writes inline (Hermes v0.22 runs it on the manager's worker).
+    sid_2 = provider._session_note_id
+    assert sid_2 == sid_1, "session_note_id should NOT change between turns"
+
+    # Verify both turn markers are present in the persisted note
+    raw = provider.handle_tool_call("bm_read", {"identifier": sid_1})
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert "integration turn-1 user" in text
+    assert marker in text
+
+
+def test_on_session_end_writes_summary_with_relations(provider, bm):
+    # Seed a session note via sync_turn
+    provider.sync_turn("first message", "first reply")
+    # sync_turn writes inline (Hermes v0.22 runs it on the manager's worker).
+    sid = provider._session_note_id
+    assert sid
+
+    provider.on_session_end(
+        [
+            {"role": "user", "content": "first message"},
+            {"role": "assistant", "content": "first reply"},
+        ]
+    )
+
+    # Search for the summary
+    raw = provider.handle_tool_call(
+        "bm_search",
+        {
+            "query": "Hermes Session Summary",
+            "limit": 5,
+        },
+    )
+    d = _parse_tool_result(raw)
+    text = (d or {}).get("text") or json.dumps(d or {})
+    assert "Hermes Session Summary" in text
+
+
+def test_prefetch_against_real_bm(provider, bm):
+    # Seed a recognizable note
+    unique = f"PREFETCH-MARKER-{uuid.uuid4().hex}"
+    provider.handle_tool_call(
+        "bm_write",
+        {
+            "title": f"Prefetch Test {unique}",
+            "content": f"# Prefetch Test\n{unique}\n",
+            "folder": "tests",
+        },
+    )
+
+    # BM's FTS index is updated synchronously inside the write_note API
+    # path (knowledge_router.py:272), so this loop is really only smoothing
+    # over the round-trip cost of a few RPCs on a slow runner. prefetch
+    # explicitly requests search_type="text" so we don't get pulled onto
+    # BM's hybrid path, where vector indexing is async and would race the
+    # search.
+    budget_secs = 10.0
+    deadline = time.monotonic() + budget_secs
+    out = ""
+    attempts = 0
+    while time.monotonic() < deadline:
+        attempts += 1
+        out = provider.prefetch(unique)
+        if out:
+            break
+        time.sleep(0.25)
+
+    assert out, (
+        f"prefetch returned nothing after {attempts} attempt(s) over "
+        f"{budget_secs}s; provider._failure_count={provider._failure_count}, "
+        f"circuit_open={provider._is_circuit_open()}. "
+        f"Either BM didn't index the note in time or prefetch's actor.call "
+        f"is timing out internally."
+    )
+    assert "Basic Memory Recall" in out
+    assert unique in out or "Prefetch Test" in out
+
+
+# ---- Workspace-qualified routing (#2015) ----
+
+
+@pytest.mark.parametrize(
+    ("hermes_tool", "extra"),
+    [
+        ("bm_read", {}),
+        ("bm_context", None),
+        ("bm_edit", {"operation": "append", "content": "x"}),
+        ("bm_delete", {}),
+        ("bm_move", {"new_folder": "archive"}),
+    ],
+)
+def test_workspace_qualified_identifier_reaches_routing_not_validation(
+    provider, hermes_tool, extra
+):
+    """BM 1.0 requires `project` on one-project tools, and refuses a call
+    without it before routing reads the identifier (#1984). The plugin used to
+    omit `project` for a workspace-qualified identifier, so the agent saw a raw
+    "Missing required keyword only argument" error. Now the identifier's own
+    'workspace/project' is passed, and an unknown project fails in routing."""
+    identifier = f"memory://personal/no-such-project-{uuid.uuid4().hex[:8]}/scratch/note"
+    args = {"url": identifier} if extra is None else {"identifier": identifier, **extra}
+
+    raw = provider.handle_tool_call(hermes_tool, args)
+
+    lowered = raw.lower()
+    assert "missing required" not in lowered, raw
+    assert "no-such-project" in lowered or "not found" in lowered, raw

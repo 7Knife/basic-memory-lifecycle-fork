@@ -1,0 +1,1468 @@
+import { beforeEach, describe, expect, it, jest } from "bun:test"
+import {
+  BmClient,
+  BmToolError,
+  describeNoteError,
+  describeToolError,
+  NoteAlreadyExistsError,
+  NoteRevisionConflictError,
+} from "./bm-client.ts"
+
+const DEFAULT_PROJECT = "test-project"
+
+function mcpResult(payload: unknown) {
+  return {
+    structuredContent: { result: payload },
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(payload),
+      },
+    ],
+  }
+}
+
+function mcpToolError(text: string) {
+  return { isError: true, content: [{ type: "text", text }] }
+}
+
+function setConnected(client: BmClient, callTool: jest.Mock) {
+  ;(client as any).client = {
+    callTool,
+    close: jest.fn().mockResolvedValue(undefined),
+  }
+  ;(client as any).transport = {
+    close: jest.fn().mockResolvedValue(undefined),
+  }
+}
+
+describe("BmClient MCP behavior", () => {
+  let client: BmClient
+
+  beforeEach(() => {
+    client = new BmClient("/usr/local/bin/bm", DEFAULT_PROJECT)
+  })
+
+  it("readNote calls bm_read with JSON output and no frontmatter by default", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "t",
+        permalink: "p",
+        content: "body",
+        file_path: "notes/t.md",
+        frontmatter: null,
+      }),
+    )
+    setConnected(client, callTool)
+
+    const note = await client.readNote("t")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_read",
+      arguments: {
+        identifier: "t",
+        include_frontmatter: false,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(note.content).toBe("body")
+  })
+
+  it("readNote includes frontmatter when requested", async () => {
+    const raw = "---\ntitle: t\n---\n\nbody"
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "t",
+        permalink: "p",
+        content: raw,
+        file_path: "notes/t.md",
+        frontmatter: { title: "t" },
+      }),
+    )
+    setConnected(client, callTool)
+
+    const note = await client.readNote("t", { includeFrontmatter: true })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_read",
+      arguments: {
+        identifier: "t",
+        include_frontmatter: true,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(note.content).toBe(raw)
+    expect(note.frontmatter).toEqual({ title: "t" })
+  })
+
+  it("writeNote calls bm_write with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "Note",
+        permalink: "notes/note",
+        file_path: "notes/note.md",
+        checksum: "abc123",
+        action: "created",
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.writeNote("Note", "hello", "notes")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_write",
+      arguments: {
+        title: "Note",
+        content: "hello",
+        directory: "notes",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.checksum).toBe("abc123")
+    expect(result.action).toBe("created")
+  })
+
+  it("writeNote passes overwrite flag when provided", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "Note",
+        permalink: "notes/note",
+        file_path: "notes/note.md",
+        action: "updated",
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.writeNote("Note", "hello", "notes", undefined, true)
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_write",
+      arguments: {
+        title: "Note",
+        content: "hello",
+        directory: "notes",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+        overwrite: true,
+      },
+    })
+  })
+
+  it("writeNote passes metadata, tags, and note_type when provided", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "Task Note",
+        permalink: "tasks/task-note",
+        file_path: "tasks/task-note.md",
+        action: "created",
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.writeNote(
+      "Task Note",
+      "hello",
+      "tasks",
+      undefined,
+      undefined,
+      {
+        metadata: {
+          status: "active",
+          scheduling: { due: "2026-09-02" },
+        },
+        tags: "work,priority",
+        noteType: "Task",
+      },
+    )
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_write",
+      arguments: {
+        title: "Task Note",
+        content: "hello",
+        directory: "tasks",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+        metadata: {
+          status: "active",
+          scheduling: { due: "2026-09-02" },
+        },
+        tags: "work,priority",
+        note_type: "Task",
+      },
+    })
+  })
+
+  it("readNote routes by project_id alone and returns the checksum", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "t",
+        permalink: "p",
+        content: "body",
+        file_path: "notes/t.md",
+        frontmatter: { type: "memory_master" },
+        checksum: "abc123",
+      }),
+    )
+    setConnected(client, callTool)
+
+    const note = await client.readNote("t", {
+      includeFrontmatter: true,
+      projectId: "6b1c3f0e-0f5e-4d6b-9a39-2a4f8c1d7e55",
+    })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_read",
+      arguments: {
+        identifier: "t",
+        include_frontmatter: true,
+        output_format: "json",
+        project: "6b1c3f0e-0f5e-4d6b-9a39-2a4f8c1d7e55",
+      },
+    })
+    expect(callTool.mock.calls[0][0].arguments).not.toHaveProperty("project_id")
+    expect(note.checksum).toBe("abc123")
+  })
+
+  it("writeNote routes by project_id alone and passes expected_checksum", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "Memory Master",
+        permalink: "memory-quest/memory-master",
+        file_path: "memory-quest/Memory Master.md",
+        checksum: "new",
+        action: "updated",
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.writeNote(
+      "Memory Master",
+      "body",
+      "memory-quest",
+      undefined,
+      true,
+      {
+        noteType: "memory_master",
+        metadata: {
+          memory_quest_code: "MQ-1",
+          memory_quest_guidance: "active",
+        },
+        projectId: "6b1c3f0e-0f5e-4d6b-9a39-2a4f8c1d7e55",
+        expectedChecksum: "old",
+      },
+    )
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_write",
+      arguments: {
+        title: "Memory Master",
+        content: "body",
+        directory: "memory-quest",
+        output_format: "json",
+        project: "6b1c3f0e-0f5e-4d6b-9a39-2a4f8c1d7e55",
+        overwrite: true,
+        note_type: "memory_master",
+        metadata: {
+          memory_quest_code: "MQ-1",
+          memory_quest_guidance: "active",
+        },
+        expected_checksum: "old",
+      },
+    })
+    expect(callTool.mock.calls[0][0].arguments).not.toHaveProperty("project_id")
+  })
+
+  it("writeNote maps a JSON ALREADY_EXISTS tool error to NoteAlreadyExistsError", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpToolError(
+        JSON.stringify({
+          error: "ALREADY_EXISTS",
+          message:
+            "A note exists at memory-quest/Memory Master.md. Nothing was written.",
+        }),
+      ),
+    )
+    setConnected(client, callTool)
+
+    const err = await client
+      .writeNote("Memory Master", "body", "memory-quest", undefined, false)
+      .catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(NoteAlreadyExistsError)
+    expect((err as NoteAlreadyExistsError).message).toContain(
+      "memory-quest/Memory Master.md",
+    )
+    expect((err as NoteAlreadyExistsError).permalink).toBe("")
+  })
+
+  it("writeNote maps REVISION_CONFLICT to NoteRevisionConflictError", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpToolError(
+        JSON.stringify({
+          error: "REVISION_CONFLICT",
+          message: "Changed since read; read again before retrying",
+        }),
+      ),
+    )
+    setConnected(client, callTool)
+
+    const err = await client
+      .writeNote("Memory Master", "body", "memory-quest", undefined, true, {
+        expectedChecksum: "stale",
+      })
+      .catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(NoteRevisionConflictError)
+    expect((err as NoteRevisionConflictError).currentChecksum).toBeNull()
+  })
+
+  it("writeNote rethrows tool errors that are not refusal payloads", async () => {
+    const callTool = jest
+      .fn()
+      .mockResolvedValue(
+        mcpToolError("expected_checksum requires overwrite=True"),
+      )
+    setConnected(client, callTool)
+
+    const err = await client
+      .writeNote("Note", "body", "notes", undefined, false, {
+        expectedChecksum: "abc",
+      })
+      .catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(BmToolError)
+    expect((err as Error).message).toBe(
+      "BM MCP tool bm_write failed: expected_checksum requires overwrite=True",
+    )
+  })
+
+  it("editNote calls bm_edit with MCP argument names", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "t",
+        permalink: "p",
+        file_path: "notes/t.md",
+        command: "find_replace",
+        checksum: "abc",
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.editNote("t", "find_replace", "new", {
+      find_text: "old",
+      expected_replacements: 2,
+    })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_edit",
+      arguments: {
+        identifier: "t",
+        command: "find_replace",
+        content: "new",
+        find_text: "old",
+        section: undefined,
+        expected_replacements: 2,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.checksum).toBe("abc")
+  })
+
+  it("editNote passes metadata to bm_edit", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        title: "t",
+        permalink: "p",
+        file_path: "notes/t.md",
+        command: "append",
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.editNote("t", "append", "new", {
+      metadata: { status: "complete", review: { approved: true } },
+    })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_edit",
+      arguments: {
+        identifier: "t",
+        command: "append",
+        content: "new",
+        metadata: { status: "complete", review: { approved: true } },
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+  })
+
+  it("search calls bm_search with paging params", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        results: [
+          {
+            title: "x",
+            permalink: "x",
+            content: "c",
+            file_path: "notes/x.md",
+            score: 0.9,
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const results = await client.search("marketing strategy", 3)
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_search",
+      arguments: {
+        query: "marketing strategy",
+        page: 1,
+        page_size: 3,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(results).toHaveLength(1)
+    expect(results[0].title).toBe("x")
+  })
+
+  it("search passes metadata_filters, tags, and status to bm_search", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        results: [
+          {
+            title: "Auth Design",
+            permalink: "auth-design",
+            content: "OAuth spec",
+            file_path: "specs/auth-design.md",
+            score: 0.85,
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const results = await client.search("oauth", 5, "research", {
+      filters: { type: "spec", confidence: { $gt: 0.7 } },
+      tags: ["security"],
+      status: "in-progress",
+    })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_search",
+      arguments: {
+        query: "oauth",
+        page: 1,
+        page_size: 5,
+        output_format: "json",
+        project: "research",
+        filters: {
+          type: "spec",
+          confidence: { $gt: 0.7 },
+          tags: { $contains: ["security"] },
+          status: "in-progress",
+        },
+      },
+    })
+    expect(results).toHaveLength(1)
+    expect(results[0].title).toBe("Auth Design")
+  })
+
+  it("search preserves explicit filters over conflicting shortcuts", async () => {
+    const callTool = jest.fn().mockResolvedValue(mcpResult({ results: [] }))
+    setConnected(client, callTool)
+    const filters = {
+      status: { $in: ["draft", "review"] },
+      tags: { $contains: ["explicit"] },
+    }
+
+    await client.search(undefined, 10, undefined, {
+      filters,
+      tags: ["shortcut"],
+      status: "published",
+    })
+
+    expect(callTool.mock.calls[0][0].arguments.filters).toEqual(filters)
+    expect(filters).toEqual({
+      status: { $in: ["draft", "review"] },
+      tags: { $contains: ["explicit"] },
+    })
+  })
+
+  it("search ignores an empty tag shortcut", async () => {
+    const callTool = jest.fn().mockResolvedValue(mcpResult({ results: [] }))
+    setConnected(client, callTool)
+
+    await client.search("test", 10, undefined, { tags: [] })
+
+    expect(callTool.mock.calls[0][0].arguments.query).toBe("test")
+    expect(callTool.mock.calls[0][0].arguments).not.toHaveProperty("filters")
+  })
+
+  it("search omits metadata args when not provided", async () => {
+    const callTool = jest.fn().mockResolvedValue(mcpResult({ results: [] }))
+    setConnected(client, callTool)
+
+    await client.search("test", 10)
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_search",
+      arguments: {
+        query: "test",
+        page: 1,
+        page_size: 10,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+  })
+
+  it("buildContext calls bm_context using output_format=json", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        results: [
+          {
+            primary_result: {
+              title: "x",
+              permalink: "x",
+              content: "body",
+              file_path: "notes/x.md",
+            },
+            observations: [],
+            related_results: [],
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const ctx = await client.buildContext("memory://notes/x", 2)
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_context",
+      arguments: {
+        identifier: "memory://notes/x",
+        depth: 2,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(ctx.results).toHaveLength(1)
+  })
+
+  it("recentActivity calls bm_recent with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        results: [
+          {
+            title: "x",
+            permalink: "x",
+            file_path: "notes/x.md",
+            created_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const recent = await client.recentActivity("7d")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_recent",
+      arguments: {
+        since: "7d",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(recent).toHaveLength(1)
+  })
+
+  it("listProjects calls bm_project_list with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        projects: [
+          {
+            name: "alpha",
+            path: "/tmp/alpha",
+            is_default: true,
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const projects = await client.listProjects()
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_project_list",
+      arguments: {
+        output_format: "json",
+      },
+    })
+    expect(projects[0].name).toBe("alpha")
+  })
+
+  it("listProjects filters workspace client-side without passing unsupported MCP args", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        projects: [
+          {
+            name: "alpha",
+            path: "/tmp/alpha",
+            workspace_name: "Team Alpha",
+            workspace_slug: "team-alpha",
+            workspace_tenant_id: "tenant-alpha",
+          },
+          {
+            name: "beta",
+            path: "/tmp/beta",
+            workspace_name: "Team Beta",
+            workspace_slug: "team-beta",
+            workspace_tenant_id: "tenant-beta",
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const projects = await client.listProjects("team-alpha")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_project_list",
+      arguments: {
+        output_format: "json",
+      },
+    })
+    expect(projects.map((project) => project.name)).toEqual(["alpha"])
+  })
+
+  it("listWorkspaces deduplicates project workspaces and excludes local projects", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        projects: [
+          {
+            name: "one",
+            workspace_tenant_id: "team-id",
+            workspace_name: "Team",
+            workspace_type: "team",
+          },
+          {
+            name: "two",
+            workspace_tenant_id: "team-id",
+            workspace_name: "Team",
+            workspace_type: "team",
+          },
+          { name: "local", path: "/tmp/local" },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+    expect(await client.listWorkspaces()).toEqual([
+      { tenant_id: "team-id", name: "Team", workspace_type: "team" },
+    ])
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_project_list",
+      arguments: { output_format: "json" },
+    })
+  })
+
+  it("ensureProject calls bm_project_create in idempotent JSON mode", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        name: "test-project",
+        path: "/tmp/memory",
+        created: false,
+        already_exists: true,
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.ensureProject("/tmp/memory")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_project_create",
+      arguments: {
+        name: "test-project",
+        path: "/tmp/memory",
+        set_default: true,
+        output_format: "json",
+      },
+    })
+  })
+
+  it("deleteNote calls bm_delete with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        action: "deleted",
+        title: "old-note",
+        permalink: "notes/old-note",
+        file_path: "notes/old-note.md",
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.deleteNote("notes/old-note")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_delete",
+      arguments: {
+        identifier: "notes/old-note",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.file_path).toBe("notes/old-note.md")
+  })
+
+  it("schemaValidate calls bm_schema_validate with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        entity_type: "person",
+        total_notes: 3,
+        total_entities: 3,
+        valid_count: 3,
+        warning_count: 0,
+        error_count: 0,
+        results: [],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.schemaValidate("person")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_schema_validate",
+      arguments: {
+        note_type: "person",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.entity_type).toBe("person")
+    expect(result.valid_count).toBe(3)
+  })
+
+  it("schemaValidate passes identifier when provided", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        entity_type: null,
+        total_notes: 1,
+        total_entities: 1,
+        valid_count: 1,
+        warning_count: 0,
+        error_count: 0,
+        results: [],
+      }),
+    )
+    setConnected(client, callTool)
+
+    await client.schemaValidate(undefined, "notes/my-note")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_schema_validate",
+      arguments: {
+        identifier: "notes/my-note",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+  })
+
+  it("schemaInfer calls bm_schema_infer with threshold", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        entity_type: "task",
+        notes_analyzed: 10,
+        field_frequencies: [],
+        suggested_schema: {},
+        suggested_required: [],
+        suggested_optional: [],
+        excluded: [],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.schemaInfer("task", 0.5)
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_schema_infer",
+      arguments: {
+        note_type: "task",
+        threshold: 0.5,
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.notes_analyzed).toBe(10)
+  })
+
+  it("schemaDiff calls bm_schema_diff with JSON output", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        entity_type: "person",
+        schema_found: true,
+        new_fields: [{ field: "phone", frequency: 0.6 }],
+        dropped_fields: [],
+        cardinality_changes: [],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.schemaDiff("person")
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_schema_diff",
+      arguments: {
+        note_type: "person",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.new_fields).toHaveLength(1)
+  })
+
+  it("search with note_types and status filters (no query)", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        results: [
+          {
+            title: "Task 1",
+            permalink: "tasks/task-1",
+            content: "active task",
+            file_path: "tasks/task-1.md",
+            score: 0.9,
+          },
+        ],
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.search(undefined, 10, undefined, {
+      note_types: ["task"],
+      status: "active",
+    })
+
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_search",
+      arguments: {
+        page: 1,
+        page_size: 10,
+        note_types: ["task"],
+        filters: { status: "active" },
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result).toHaveLength(1)
+    expect(result[0].title).toBe("Task 1")
+  })
+
+  it("moveNote calls bm_move with destination_folder in a single MCP call", async () => {
+    const callTool = jest.fn().mockResolvedValue(
+      mcpResult({
+        action: "moved",
+        title: "My Note",
+        permalink: "archive/my-note",
+        file_path: "archive/my-note.md",
+        source: "notes/my-note",
+        destination: "archive/my-note.md",
+      }),
+    )
+    setConnected(client, callTool)
+
+    const result = await client.moveNote("notes/my-note", "archive")
+
+    expect(callTool).toHaveBeenCalledTimes(1)
+    expect(callTool).toHaveBeenCalledWith({
+      name: "bm_move",
+      arguments: {
+        identifier: "notes/my-note",
+        destination: "archive/",
+        output_format: "json",
+        project: DEFAULT_PROJECT,
+      },
+    })
+    expect(result.title).toBe("My Note")
+    expect(result.file_path).toBe("archive/my-note.md")
+  })
+
+  it("indexConversation surfaces non-not-found append errors without creating", async () => {
+    ;(client as any).editNote = jest
+      .fn()
+      .mockRejectedValue(new Error("validation failed"))
+    ;(client as any).writeNote = jest.fn()
+
+    await expect(
+      client.indexConversation(
+        "user message long enough",
+        "assistant reply long enough",
+      ),
+    ).rejects.toThrow("validation failed")
+
+    expect((client as any).writeNote).not.toHaveBeenCalled()
+  })
+
+  it("indexConversation creates fallback note only on note-not-found errors", async () => {
+    ;(client as any).editNote = jest
+      .fn()
+      .mockRejectedValue(
+        new BmToolError(
+          "bm_edit",
+          JSON.stringify({ error: "NOT_FOUND", message: "Missing note" }),
+        ),
+      )
+    ;(client as any).writeNote = jest.fn().mockResolvedValue({
+      title: "conversations",
+      permalink: "conversations",
+      content: "x",
+      file_path: "conversations/x.md",
+    })
+
+    await client.indexConversation(
+      "user message long enough",
+      "assistant reply long enough",
+    )
+
+    expect((client as any).writeNote).toHaveBeenCalledTimes(1)
+    const args = (client as any).writeNote.mock.calls[0]
+    expect(args[3]).toBeUndefined() // project
+    expect(args[4]).toBeUndefined() // overwrite
+  })
+
+  it("describes tool errors with the server's own reason", () => {
+    expect(
+      describeToolError(
+        new BmToolError(
+          "bm_edit",
+          JSON.stringify({ error: "CONFLICT", message: "checksum changed" }),
+        ),
+      ),
+    ).toBe("CONFLICT: checksum changed")
+    // Plain-text tool failures (older servers) pass through unchanged.
+    expect(
+      describeToolError(new BmToolError("bm_read", "database is locked")),
+    ).toBe("database is locked")
+    expect(describeToolError(new Error("spawn bm ENOENT"))).toBe(
+      "spawn bm ENOENT",
+    )
+    expect(
+      describeNoteError(
+        new BmToolError(
+          "bm_read",
+          JSON.stringify({ error: "NOT_FOUND", message: "Missing note" }),
+        ),
+      ),
+    ).toBe("it does not exist. NOT_FOUND: Missing note")
+  })
+
+  describe("startup gate", () => {
+    const structured = (payload: unknown) => ({ structuredContent: payload })
+
+    it("holds tool calls until startup has created the project", async () => {
+      let finishConnect = () => {}
+      ;(client as any).connectWithRetries = jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishConnect = resolve
+          }),
+      )
+      const callToolRaw = jest.fn(async (name: string) =>
+        name === "bm_project_create"
+          ? structured({ ok: true })
+          : structured({ projects: [] }),
+      )
+      ;(client as any).callToolRaw = callToolRaw
+
+      const startup = client.start({ projectPath: "/tmp/ws/memory" })
+      const listing = client.listProjects()
+      await Promise.resolve()
+      expect(callToolRaw).not.toHaveBeenCalled()
+
+      finishConnect()
+      await startup
+      await listing
+
+      // Project creation runs first, then the waiting call.
+      expect(callToolRaw.mock.calls.map(([name]) => name)).toEqual([
+        "bm_project_create",
+        "bm_project_list",
+      ])
+    })
+
+    it("retries a failed startup once for the next tool calls", async () => {
+      const connect = jest
+        .fn()
+        .mockRejectedValueOnce(new Error("bm not ready"))
+        .mockResolvedValue(undefined)
+      ;(client as any).connectWithRetries = connect
+      ;(client as any).callToolRaw = jest.fn(async () =>
+        structured({ projects: [] }),
+      )
+
+      await expect(client.start()).rejects.toThrow("bm not ready")
+      await Promise.all([client.listProjects(), client.listProjects()])
+
+      // One original attempt plus one retry shared by both callers.
+      expect(connect).toHaveBeenCalledTimes(2)
+    })
+
+    // Regression (#1988): since #1846, BM refuses a create whose path differs
+    // from where a project of that name is stored. With projectPath left at
+    // its workspace-root default, startup must use the stored folder.
+    describe("an existing project at another folder", () => {
+      const projectUnavailable =
+        'Basic Memory project "test-project" is unavailable: ALREADY_EXISTS'
+      const pathMismatch = new BmToolError(
+        "bm_project_create",
+        JSON.stringify({
+          error: "ALREADY_EXISTS",
+          message:
+            "Project 'test-project' already exists at /ws/test-project, not /ws.",
+        }),
+      )
+
+      // A stand-in BM holding one project, refusing creates at another path
+      // the way the 1.0 server does.
+      function serveStoredProject(storedPath: string) {
+        const projects = [
+          { name: "Test-Project", path: storedPath, local_path: storedPath },
+        ]
+        const callToolRaw = jest.fn(
+          async (name: string, args: Record<string, unknown>) => {
+            if (name === "bm_read") {
+              return structured({
+                result: {
+                  title: "t",
+                  permalink: "t",
+                  content: "body",
+                  file_path: "t.md",
+                },
+              })
+            }
+            if (name === "bm_project_list") return structured({ projects })
+            if (args.path !== storedPath) throw pathMismatch
+            return structured({ name: "Test-Project", already_exists: true })
+          },
+        )
+        ;(client as any).connectWithRetries = jest
+          .fn()
+          .mockResolvedValue(undefined)
+        ;(client as any).callToolRaw = callToolRaw
+        return callToolRaw
+      }
+
+      const createCalls = (callToolRaw: jest.Mock) =>
+        callToolRaw.mock.calls.filter(([name]) => name === "bm_project_create")
+
+      it("adopts the stored folder when projectPath is the default", async () => {
+        const callToolRaw = serveStoredProject("/ws/test-project")
+
+        await client.start({ projectPath: "/ws", adoptExistingProject: true })
+
+        expect(createCalls(callToolRaw)).toHaveLength(1)
+        expect(createCalls(callToolRaw)[0][1]).toMatchObject({
+          name: DEFAULT_PROJECT,
+          path: "/ws/test-project",
+        })
+        expect(client.projectUnavailableReason()).toBeNull()
+        await expect(client.readNote("t")).resolves.toMatchObject({
+          content: "body",
+        })
+      })
+
+      it("creates at the default path when no project has the name", async () => {
+        const callToolRaw = jest.fn(async (name: string) =>
+          name === "bm_project_list"
+            ? structured({
+                projects: [{ name: "other", path: "/elsewhere" }],
+              })
+            : structured({ name: DEFAULT_PROJECT, created: true }),
+        )
+        ;(client as any).connectWithRetries = jest
+          .fn()
+          .mockResolvedValue(undefined)
+        ;(client as any).callToolRaw = callToolRaw
+
+        await client.start({ projectPath: "/ws", adoptExistingProject: true })
+
+        expect(createCalls(callToolRaw)[0][1]).toMatchObject({ path: "/ws" })
+      })
+
+      // With cloud credentials, a cloud-only row for the same name can sort
+      // ahead of the row attached to the local project. Its path is
+      // tenant-relative, and a local create there would be refused.
+      it("adopts the local row, not a cloud-only row of the same name", async () => {
+        const callToolRaw = jest.fn(async (name: string) =>
+          name === "bm_project_list"
+            ? structured({
+                projects: [
+                  {
+                    name: "test-project",
+                    path: "/test-project",
+                    local_path: null,
+                    source: "cloud",
+                  },
+                  {
+                    name: "test-project",
+                    path: "/ws",
+                    local_path: "/ws",
+                    source: "local+cloud",
+                  },
+                ],
+              })
+            : structured({ name: DEFAULT_PROJECT, already_exists: true }),
+        )
+        ;(client as any).connectWithRetries = jest
+          .fn()
+          .mockResolvedValue(undefined)
+        ;(client as any).callToolRaw = callToolRaw
+
+        await client.start({ projectPath: "/ws", adoptExistingProject: true })
+
+        expect(createCalls(callToolRaw)).toHaveLength(1)
+        expect(createCalls(callToolRaw)[0][1]).toMatchObject({ path: "/ws" })
+      })
+
+      it("creates at the default path when only a cloud row has the name", async () => {
+        const callToolRaw = jest.fn(async (name: string) =>
+          name === "bm_project_list"
+            ? structured({
+                projects: [
+                  {
+                    name: "test-project",
+                    path: "/test-project",
+                    local_path: null,
+                    source: "cloud",
+                  },
+                ],
+              })
+            : structured({ name: DEFAULT_PROJECT, created: true }),
+        )
+        ;(client as any).connectWithRetries = jest
+          .fn()
+          .mockResolvedValue(undefined)
+        ;(client as any).callToolRaw = callToolRaw
+
+        await client.start({ projectPath: "/ws", adoptExistingProject: true })
+
+        expect(createCalls(callToolRaw)[0][1]).toMatchObject({ path: "/ws" })
+      })
+
+      it("keeps a configured projectPath and reports BM's refusal", async () => {
+        const callToolRaw = serveStoredProject("/ws/test-project")
+
+        // A configured path is the user's choice, so startup must not
+        // silently swap in the stored one; it still finishes connecting.
+        await client.start({ projectPath: "/ws" })
+
+        expect(createCalls(callToolRaw)).toHaveLength(1)
+        expect(createCalls(callToolRaw)[0][1]).toMatchObject({ path: "/ws" })
+        expect(client.projectUnavailableReason()).toBe(
+          "ALREADY_EXISTS: Project 'test-project' already exists at /ws/test-project, not /ws.",
+        )
+
+        // Listing still works so the user can see where the project lives;
+        // project-scoped calls report the refusal instead of a dead plugin.
+        await expect(client.listProjects()).resolves.toEqual([
+          {
+            name: "Test-Project",
+            path: "/ws/test-project",
+            local_path: "/ws/test-project",
+          },
+        ])
+        await expect(client.listWorkspaces()).resolves.toEqual([])
+        await expect(client.readNote("t")).rejects.toThrow(projectUnavailable)
+      })
+
+      it("lets calls that name another project through after a refusal", async () => {
+        const callToolRaw = serveStoredProject("/ws/test-project")
+        callToolRaw.mockImplementation(
+          async (name: string, _args: Record<string, unknown>) => {
+            if (name === "bm_project_create") throw pathMismatch
+            if (name === "bm_read") {
+              return structured({
+                result: {
+                  title: "other",
+                  permalink: "other",
+                  content: "healthy",
+                  file_path: "other.md",
+                },
+              })
+            }
+            return structured({
+              result: { title: "n", permalink: "n", file_path: "n.md" },
+            })
+          },
+        )
+
+        await client.start({ projectPath: "/ws" })
+
+        // The refusal belongs to the plugin's project only: explicit reads
+        // and writes elsewhere reach BM, by id or by name.
+        await expect(
+          client.readNote("other", { projectId: "other-project-uuid" }),
+        ).resolves.toMatchObject({ content: "healthy" })
+        await expect(
+          client.writeNote("n", "body", "notes", "other-project"),
+        ).resolves.toMatchObject({ file_path: "n.md" })
+        expect(
+          callToolRaw.mock.calls
+            .filter(([name]) => !name.startsWith("bm_project_"))
+            .map(([name, args]) => [name, args.project]),
+        ).toEqual([
+          ["bm_read", "other-project-uuid"],
+          ["bm_write", "other-project"],
+        ])
+
+        // Calls routed to the plugin's project, by default or by name in any
+        // case, still report the refusal without reaching BM.
+        await expect(client.readNote("t")).rejects.toThrow(projectUnavailable)
+        await expect(
+          client.writeNote("n", "body", "notes", "TEST-PROJECT"),
+        ).rejects.toThrow(projectUnavailable)
+        expect(
+          callToolRaw.mock.calls.filter(
+            ([name]) => !name.startsWith("bm_project_"),
+          ),
+        ).toHaveLength(2)
+      })
+
+      it("still retries a create that failed without a refusal", async () => {
+        const create = jest
+          .fn()
+          .mockRejectedValueOnce(
+            new BmToolError("bm_project_create", "database is locked"),
+          )
+          .mockResolvedValue(structured({ name: DEFAULT_PROJECT }))
+        ;(client as any).connectWithRetries = jest
+          .fn()
+          .mockResolvedValue(undefined)
+        ;(client as any).callToolRaw = jest.fn(async (name: string) =>
+          name === "bm_project_create"
+            ? create()
+            : structured({ projects: [] }),
+        )
+
+        // A transient failure is not kept as the project's state: startup
+        // fails, and the next tool call's retry creates the project.
+        await expect(client.start({ projectPath: "/ws" })).rejects.toThrow(
+          "database is locked",
+        )
+        expect(client.projectUnavailableReason()).toBeNull()
+        await expect(client.listProjects()).resolves.toEqual([])
+        expect(create).toHaveBeenCalledTimes(2)
+      })
+    })
+
+    it("surfaces the retry's error when startup keeps failing", async () => {
+      ;(client as any).connectWithRetries = jest
+        .fn()
+        .mockRejectedValue(new Error("BM MCP unavailable: spawn bm ENOENT"))
+
+      await expect(client.start()).rejects.toThrow("spawn bm ENOENT")
+      await expect(client.listProjects()).rejects.toThrow("spawn bm ENOENT")
+    })
+  })
+
+  it("reports the service as running only between start() and stop()", async () => {
+    ;(client as any).connectWithRetries = jest.fn().mockResolvedValue(undefined)
+    ;(client as any).disconnectCurrent = jest.fn().mockResolvedValue(undefined)
+
+    expect(client.isServiceRunning()).toBe(false)
+    // A lazy connection from a tool call is not service ownership.
+    setConnected(client, jest.fn())
+    expect(client.isServiceRunning()).toBe(false)
+
+    await client.start()
+    expect(client.isServiceRunning()).toBe(true)
+
+    await client.stop()
+    expect(client.isServiceRunning()).toBe(false)
+  })
+
+  describe("indexConversation with a turn key", () => {
+    // In-memory stand-in for the conversation notes so the duplicate check,
+    // append, and create paths run against shared state.
+    let notes: Map<string, string>
+    const notFound = () =>
+      new BmToolError(
+        "bm_read",
+        JSON.stringify({ error: "NOT_FOUND", message: "Missing note" }),
+      )
+    const today = () =>
+      `conversations-${new Date().toISOString().split("T")[0]}`
+
+    beforeEach(() => {
+      notes = new Map()
+      ;(client as any).readNote = jest.fn(async (identifier: string) => {
+        const content = notes.get(identifier)
+        if (content === undefined) throw notFound()
+        return { title: identifier, permalink: identifier, content }
+      })
+      ;(client as any).editNote = jest.fn(
+        async (identifier: string, _op: string, entry: string) => {
+          const content = notes.get(identifier)
+          if (content === undefined) throw notFound()
+          notes.set(identifier, `${content}\n${entry}`)
+        },
+      )
+      ;(client as any).writeNote = jest.fn(
+        async (title: string, content: string) => {
+          notes.set(title, content)
+        },
+      )
+    })
+
+    it("records a marker and reports the first write as committed", async () => {
+      const status = await client.indexConversation(
+        "user message long enough",
+        "assistant reply long enough",
+        { turnKey: "advance-1" },
+      )
+
+      expect(status).toBe("committed")
+      expect(notes.get(today())).toMatch(/<!-- openclaw-turn:[0-9a-f]{32} -->/)
+    })
+
+    it("reports a retried key as a duplicate without writing again", async () => {
+      await client.indexConversation("first user", "first reply", {
+        turnKey: "advance-1",
+      })
+      const status = await client.indexConversation(
+        "first user",
+        "first reply",
+        { turnKey: "advance-1" },
+      )
+
+      expect(status).toBe("duplicate")
+      expect(notes.get(today())?.match(/openclaw-turn:/g)).toHaveLength(1)
+    })
+
+    it("finds a key recorded in yesterday's note after midnight", async () => {
+      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+        .toISOString()
+        .split("T")[0]
+      await client.indexConversation("late user", "late reply", {
+        turnKey: "advance-1",
+      })
+      notes.set(`conversations-${yesterday}`, notes.get(today()) ?? "")
+      notes.delete(today())
+
+      const status = await client.indexConversation("late user", "late reply", {
+        turnKey: "advance-1",
+      })
+
+      expect(status).toBe("duplicate")
+      expect(notes.has(today())).toBe(false)
+    })
+
+    it("writes concurrent retries of one key exactly once", async () => {
+      const statuses = await Promise.all([
+        client.indexConversation("same user", "same reply", {
+          turnKey: "advance-1",
+        }),
+        client.indexConversation("same user", "same reply", {
+          turnKey: "advance-1",
+        }),
+      ])
+
+      expect(statuses.sort()).toEqual(["committed", "duplicate"])
+      expect(notes.get(today())?.match(/openclaw-turn:/g)).toHaveLength(1)
+    })
+
+    it("keeps different keys as separate entries", async () => {
+      await client.indexConversation("user one", "reply one", {
+        turnKey: "advance-1",
+      })
+      const status = await client.indexConversation("user two", "reply two", {
+        turnKey: "advance-2",
+      })
+
+      expect(status).toBe("committed")
+      expect(notes.get(today())?.match(/openclaw-turn:/g)).toHaveLength(2)
+    })
+
+    it("propagates a failed duplicate check instead of writing blind", async () => {
+      ;(client as any).readNote = jest
+        .fn()
+        .mockRejectedValue(new Error("BM MCP unavailable"))
+
+      await expect(
+        client.indexConversation("user", "reply", { turnKey: "advance-1" }),
+      ).rejects.toThrow("BM MCP unavailable")
+      expect((client as any).editNote).not.toHaveBeenCalled()
+    })
+
+    it("propagates a failed note create so the host can retry", async () => {
+      ;(client as any).writeNote = jest
+        .fn()
+        .mockRejectedValue(new Error("disk full"))
+
+      await expect(
+        client.indexConversation("user", "reply", { turnKey: "advance-1" }),
+      ).rejects.toThrow("disk full")
+    })
+
+    it("keeps capturing after an earlier capture failed", async () => {
+      ;(client as any).writeNote = jest
+        .fn()
+        .mockRejectedValueOnce(new Error("disk full"))
+        .mockImplementation(async (title: string, content: string) => {
+          notes.set(title, content)
+        })
+
+      await expect(
+        client.indexConversation("user", "reply", { turnKey: "advance-1" }),
+      ).rejects.toThrow("disk full")
+      await expect(
+        client.indexConversation("user", "reply", { turnKey: "advance-1" }),
+      ).resolves.toBe("committed")
+    })
+  })
+
+  it("retries recoverable MCP failures with bounded attempts", async () => {
+    ;(client as any).retryDelaysMs = [0, 0, 0]
+
+    const callTool = jest
+      .fn()
+      .mockRejectedValue(new Error("connection closed by peer"))
+
+    ;(client as any).ensureConnected = jest.fn().mockResolvedValue({ callTool })
+    ;(client as any).disconnectCurrent = jest.fn().mockResolvedValue(undefined)
+    ;(client as any).client = { close: jest.fn().mockResolvedValue(undefined) }
+    ;(client as any).transport = {
+      close: jest.fn().mockResolvedValue(undefined),
+    }
+
+    await expect(
+      (client as any).callToolRaw("bm_search", { query: "x" }),
+    ).rejects.toThrow("BM MCP unavailable")
+
+    expect((client as any).ensureConnected).toHaveBeenCalledTimes(4)
+    expect((client as any).disconnectCurrent).toHaveBeenCalledTimes(4)
+  })
+
+  it("does not retry non-recoverable tool failures", async () => {
+    ;(client as any).retryDelaysMs = [0, 0, 0]
+
+    const callTool = jest.fn().mockRejectedValue(new Error("invalid params"))
+
+    ;(client as any).ensureConnected = jest.fn().mockResolvedValue({ callTool })
+    ;(client as any).disconnectCurrent = jest.fn().mockResolvedValue(undefined)
+
+    await expect(
+      (client as any).callToolRaw("bm_search", { query: "x" }),
+    ).rejects.toThrow("invalid params")
+
+    expect((client as any).ensureConnected).toHaveBeenCalledTimes(1)
+    expect((client as any).disconnectCurrent).toHaveBeenCalledTimes(0)
+  })
+})

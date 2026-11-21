@@ -1,0 +1,631 @@
+name: Tests
+
+concurrency:
+  group: bm-ci-${{ github.workflow }}-${{ github.repository }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+on:
+  # Trigger: PR branch pushes already publish commit statuses that show up on the PR.
+  # Why: running the full matrix on both push and pull_request doubles CI time for the
+  #      exact same branch head commit.
+  # Outcome: each branch push runs the test suite once, including PR updates.
+  push:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  # CI always runs the full suite, partitioned across parallel jobs.
+  BASIC_MEMORY_ENV: test
+
+# Every job that builds a uv environment sets UV_PYTHON. Without it, `uv run`
+# — which every `just` recipe shells out to — resolves its interpreter from
+# .python-version (3.14) rather than the matrix version, and DELETES a .venv
+# that disagrees, taking the pip-installed extras with it. That is why the
+# 3.12/3.13 matrix rows silently tested 3.14 and why typecheck lost pymilvus.
+jobs:
+  changes:
+    # Docs/workflow-only changes skip the entire test matrix while the workflow
+    # still concludes successfully.
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Tests only runs on push events; for branch pushes compare against
+          # main (merge-base), for main pushes dorny diffs the push range.
+          base: main
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'test-int/**'
+              - 'alembic/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'justfile'
+              - '.github/workflows/test.yml'
+              - 'scripts/**'
+              - '.test_durations'
+
+  static-checks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Static Checks (Python 3.12)
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: "3.12"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,milvus,pdf]"
+
+      - name: Run type checks
+        run: |
+          just typecheck
+
+      - name: Run linting
+        run: |
+          just lint
+
+  test-cli-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: CLI startup and exit smoke
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - uses: extractions/setup-just@v4
+      - name: Install dependencies
+        run: uv sync --locked --extra pdf
+      # No dependency selection: these tests execute product code in children.
+      - name: Run tests
+        run: just test-cli-smoke --durations=15 --junitxml=cli-smoke.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-smoke
+          path: cli-smoke.xml
+
+  test-windows-platform:
+    needs: changes
+    # The full Windows suites run only on main. Keep these path, checksum and
+    # CLI lifecycle regressions covered before merge without that suite's cost.
+    if: needs.changes.outputs.code == 'true' && github.ref_name != 'main'
+    name: Windows path and checksum regressions (Python 3.12)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: "3.12"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv venv
+          uv pip install -e ".[dev,pdf]"
+      - name: Run platform regressions
+        run: >-
+          uv run pytest
+          tests/cli/test_wiki_command.py
+          tests/indexing/test_note_content_promotion_guard.py
+          tests/indexing/test_storage_change_journal.py
+          tests/mcp/test_tool_bm_delete.py
+          tests/mcp/test_tool_bm_project.py
+          tests/mcp/test_tool_bm_project_cloud.py
+          test-int/mcp/test_bm_project_integration.py
+          -q --no-cov --junitxml=windows-platform.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-platform
+          path: windows-platform.xml
+
+  test-sqlite-unit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test SQLite Unit (${{ matrix.os }}, Python ${{ matrix.python-version }}, shard ${{ matrix.group }}/4)
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+        exclude:
+          # Windows carries platform coverage on one Python version.
+          - os: windows-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.14"
+          # Windows is the slowest row, so branch pushes skip it and main runs it.
+          - os: ${{ github.ref_name == 'main' && 'none' || 'windows-latest' }}
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      # The ubuntu 3.14 rows record coverage for the coverage job; sysmon keeps it cheap.
+      BASIC_MEMORY_PYTEST_COV_FLAGS: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14' && '--cov --cov-report= --cov-fail-under=0' || '--no-cov' }}
+      COVERAGE_CORE: sysmon
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Run tests
+        run: |
+          just test-unit-sqlite --splits 4 --group ${{ matrix.group }} --file-list test-files.txt --durations=30 --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-sqlite-unit-${{ runner.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: |
+            test-results.xml
+            test-files.txt
+
+      - name: Upload coverage data
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-sqlite-unit-g${{ matrix.group }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  test-sqlite-integration:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test SQLite Integration (${{ matrix.os }}, Python ${{ matrix.python-version }}, shard ${{ matrix.group }}/2)
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2]
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+        exclude:
+          # Windows carries platform coverage on one Python version.
+          - os: windows-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.14"
+          # Windows is the slowest row, so branch pushes skip it and main runs it.
+          - os: ${{ github.ref_name == 'main' && 'none' || 'windows-latest' }}
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+      # The ubuntu 3.14 rows record coverage for the coverage job; sysmon keeps it cheap.
+      BASIC_MEMORY_PYTEST_COV_FLAGS: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14' && '--cov --cov-report= --cov-fail-under=0' || '--no-cov' }}
+      COVERAGE_CORE: sysmon
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Run tests
+        run: |
+          just test-int-sqlite --splits 2 --group ${{ matrix.group }} --file-list test-files.txt --durations=30 --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-sqlite-integration-${{ runner.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: |
+            test-results.xml
+            test-files.txt
+
+      - name: Upload coverage data
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-sqlite-integration-g${{ matrix.group }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  test-postgres-unit:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test Postgres Unit (Python ${{ matrix.python-version }}, shard ${{ matrix.group }}/4)
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Shard the largest suite across parallel jobs: each shard is a full job
+        # with its own Postgres service running 1/4 of the files, balanced
+        # by the recorded .test_durations (refresh with `just test-durations-postgres`).
+        # Within a shard, xdist runs one worker per runner core (2 on ubuntu-latest),
+        # each on its own database on that service.
+        # Postgres runs on the latest Python only — the SQLite matrix carries
+        # Python-version coverage; Postgres carries backend coverage.
+        group: [1, 2, 3, 4]
+        python-version: ["3.14"]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: basic_memory_user
+          POSTGRES_PASSWORD: dev_password
+          POSTGRES_DB: basic_memory_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basic_memory_user -d basic_memory_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BASIC_MEMORY_TEST_POSTGRES: "1"
+      BASIC_MEMORY_TEST_POSTGRES_URL: postgresql://basic_memory_user:dev_password@127.0.0.1:5432/basic_memory_test
+      # Pin every uv call, including `uv run` inside just recipes. See top of file.
+      UV_PYTHON: ${{ matrix.python-version }}
+      # Postgres jobs always record coverage for the coverage job. A shard covers part of
+      # the code, so only the Coverage job enforces fail_under (--cov-fail-under=0 here).
+      BASIC_MEMORY_PYTEST_COV_FLAGS: --cov --cov-report= --cov-fail-under=0
+      COVERAGE_CORE: sysmon
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Run tests
+        run: |
+          just test-unit-postgres --splits 4 --group ${{ matrix.group }} --file-list test-files.txt --durations=30 --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-postgres-unit-${{ runner.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: |
+            test-results.xml
+            test-files.txt
+
+      - name: Upload coverage data
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-postgres-unit-g${{ matrix.group }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  test-postgres-integration:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test Postgres Integration (Python ${{ matrix.python-version }}, shard ${{ matrix.group }}/4)
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2, 3, 4]
+        # Latest Python only: SQLite carries version coverage, Postgres carries
+        # backend coverage.
+        python-version: ["3.14"]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: basic_memory_user
+          POSTGRES_PASSWORD: dev_password
+          POSTGRES_DB: basic_memory_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U basic_memory_user -d basic_memory_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BASIC_MEMORY_TEST_POSTGRES: "1"
+      BASIC_MEMORY_TEST_POSTGRES_URL: postgresql://basic_memory_user:dev_password@127.0.0.1:5432/basic_memory_test
+      # Pin every uv call, including `uv run` inside just recipes. See top of file.
+      UV_PYTHON: ${{ matrix.python-version }}
+      # Postgres jobs always record coverage for the coverage job. A shard covers part of
+      # the code, so only the Coverage job enforces fail_under (--cov-fail-under=0 here).
+      BASIC_MEMORY_PYTEST_COV_FLAGS: --cov --cov-report= --cov-fail-under=0
+      COVERAGE_CORE: sysmon
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Run tests
+        run: |
+          just test-int-postgres --splits 4 --group ${{ matrix.group }} --file-list test-files.txt --durations=30 --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-postgres-integration-${{ runner.os }}-py${{ matrix.python-version }}-g${{ matrix.group }}
+          path: |
+            test-results.xml
+            test-files.txt
+
+      - name: Upload coverage data
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-postgres-integration-g${{ matrix.group }}
+          path: .coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  coverage:
+    # One report over every suite: SQLite unit and integration (ubuntu, 3.14) and
+    # Postgres unit and integration. fail_under in pyproject.toml is the floor.
+    needs:
+      [changes, test-sqlite-unit, test-sqlite-integration, test-postgres-unit, test-postgres-integration]
+    if: needs.changes.outputs.code == 'true'
+    name: Coverage
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: "3.14"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: coverage-data
+
+      - name: Combine and report
+        run: |
+          uv run coverage combine coverage-data/*/.coverage
+          # The summary is informational; the second report enforces fail_under.
+          uv run coverage report --format=markdown --skip-covered --sort=-miss --fail-under=0 >> "$GITHUB_STEP_SUMMARY"
+          uv run coverage report --skip-covered --sort=-miss
+
+  test-semantic:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test Semantic (Python 3.12)
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: "3.12"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - uses: extractions/setup-just@v4
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install dependencies
+        run: |
+          uv pip install -e ".[dev,pdf]"
+
+      - name: Run tests
+        run: |
+          just test-semantic --durations=30 --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-py3.12
+          path: test-results.xml
+
+  test-milvus:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Test Milvus (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.12"
+    runs-on: ${{ matrix.os }}
+
+    # Pin every uv call, including `uv run` inside just recipes. See top of file.
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install uv
+        run: |
+          pip install uv
+
+      - name: Create virtual env
+        run: |
+          uv venv
+
+      - name: Install Milvus extra
+        run: |
+          uv pip install -e ".[dev,milvus,pdf]"
+
+      - name: Run Milvus tests
+        run: |
+          uv run pytest -q --no-cov tests/repository/test_milvus_config.py tests/repository/test_milvus_repository.py tests/repository/test_milvus_index.py test-int/semantic/test_milvus_lite.py
