@@ -1,5 +1,19 @@
 # Contributing to Basic Memory
 
+> **Fork notice:** This repository is an independent, experimental fork. The
+> upstream CLA/DCO and contribution terms below still apply to upstream
+> material and upstream contributions. For this fork, upstream changes are not
+> merged automatically; syncs are intentional and must be checked against the
+> lifecycle tools, metadata, and tests. Lifecycle behavior is opt-in via
+> `BASIC_MEMORY_LIFECYCLE=1`, and `bm_search` remains read-only. The fork's
+> core targeted test commands are:
+>
+> ```bash
+> .venv/Scripts/python.exe -m pytest tests/mcp/test_lifecycle_hit.py tests/mcp/test_tool_contracts.py -q -p no:cacheprovider
+> .venv/Scripts/python.exe -m pytest tests/lifecycle/ tests/mcp/test_tool_bm_search.py -q -p no:cacheprovider
+> .venv/Scripts/python.exe -m pytest tests/mcp/test_review_server.py -q -p no:cacheprovider
+> ```
+
 Thank you for considering contributing to Basic Memory! This document outlines the process for contributing to the
 project and how to get started as a developer.
 

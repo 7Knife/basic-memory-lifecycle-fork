@@ -1,6 +1,22 @@
 <!-- mcp-name: io.github.basicmachines-co/basic-memory -->
 > This is a fork of Basic Memory, licensed under AGPL-3.0
 
+> **Fork Notice**
+>
+> This is an independent fork of [Basic Memory](https://github.com/basicmachines-co/basic-memory),
+> licensed under AGPL-3.0. The original project and its copyright belong to
+> Basic Machines, Inc. This fork is not affiliated with or maintained by Basic Machines, Inc.
+>
+> **What's different in this fork:**
+>
+> - Generic, opt-in memory **lifecycle management**: weight decay, hit bonus,
+>   canon status, and a review queue.
+> - New MCP tools: `bm_memory_review_hit`, `bm_memory_review_propose/list/decide/apply/status`.
+> - Lifecycle features are gated behind `BASIC_MEMORY_LIFECYCLE=1`;
+>   upstream behavior is unchanged when disabled.
+>
+> Upstream: https://github.com/basicmachines-co/basic-memory
+
 [![MCP Toplist](https://mcptoplist.com/badge/io.github.basicmachines-co%2Fbasic-memory.svg)](https://mcptoplist.com/server/io.github.basicmachines-co%2Fbasic-memory)
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
@@ -11,6 +27,17 @@
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/basicmachines-co/basic-memory)
+
+## Upstream Cloud offering (not provided by this fork)
+
+> The Cloud offering described below, including the local install table and
+> "Cloud vs. local" comparison, belongs to the upstream Basic Memory project,
+> not this fork. This repository does not sell, host, or operate Basic Memory
+> Cloud. Do not use the links or trial codes below to purchase service from
+> this fork.
+
+The following upstream documentation is retained for context only; its Cloud
+offers, install commands, badges, and support links are not fork-specific.
 
 ## Skip the install — try Basic Memory in the cloud
 
