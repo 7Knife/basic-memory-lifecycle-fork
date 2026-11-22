@@ -76,4 +76,5 @@ claude-output
 .pytest-tmp*/
 .acl-recovery/
 pytest-cache-files-*/
+pytest-of-*/
 

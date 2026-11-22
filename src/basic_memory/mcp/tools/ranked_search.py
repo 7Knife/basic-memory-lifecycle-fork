@@ -22,10 +22,9 @@ from pydantic import AliasChoices, BeforeValidator, Field
 
 from basic_memory.config import ConfigManager
 from basic_memory.lifecycle import (
-    FIELD_CANON_STATUS,
-    CANON_ARCHIVED,
     lifecycle_enabled,
     rank_score as _lifecycle_rank_score,
+    should_hide as _lifecycle_should_hide,
 )
 from basic_memory.markdown.line_scanning import LiteralLineScan, scan_lines
 from basic_memory.mcp.clients import KnowledgeClient, SearchClient
@@ -79,6 +78,16 @@ type SearchMode = Literal["hybrid", "text", "semantic", "title", "permalink"]
 type LifecycleSort = Literal["relevance", "weight"]
 
 
+def _round_score(value: float) -> float:
+    """Round a score to 6 significant digits.
+
+    A fixed number of decimals would flatten scores that live on a small scale
+    (SQLite's bm25 is around 1e-6 for a short corpus) into equal values, and
+    the sort below reads the score it writes, so the order would be lost.
+    """
+    return float(f"{value:.6g}")
+
+
 def _apply_lifecycle_to_payload(
     payload: dict[str, Any],
     *,
@@ -103,7 +112,7 @@ def _apply_lifecycle_to_payload(
             kept.append(row)
             continue
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        if not include_archived and str(meta.get(FIELD_CANON_STATUS, "") or "") == CANON_ARCHIVED:
+        if _lifecycle_should_hide(meta, include_archived):
             hidden_archived += 1
             continue
         if sort_by == "weight":
@@ -111,7 +120,7 @@ def _apply_lifecycle_to_payload(
                 relevance = float(row.get("score") or 0.0)
             except (TypeError, ValueError):
                 relevance = 0.0
-            row = {**row, "score": round(_lifecycle_rank_score(meta, relevance), 6)}
+            row = {**row, "score": _round_score(_lifecycle_rank_score(meta, relevance))}
         kept.append(row)
     if sort_by == "weight":
         kept.sort(key=lambda row: row.get("score") or 0.0, reverse=True)
@@ -178,11 +187,15 @@ async def bm_search(
     filters: Filters = None,
     sort_by: Annotated[
         LifecycleSort,
-        Field(description="Result ordering. 'weight' applies lifecycle weight/status to the score."),
+        Field(
+            description="Result ordering. 'weight' applies lifecycle weight/status to the score."
+        ),
     ] = "relevance",
     include_archived: Annotated[
         bool,
-        Field(description="Include canon_status=archived notes (excluded by default when lifecycle is on)."),
+        Field(
+            description="Include canon_status=archived notes (excluded by default when lifecycle is on)."
+        ),
     ] = False,
     note_types: Annotated[
         StringList,

@@ -22,6 +22,8 @@ import logfire
 from basic_memory import db
 from basic_memory.indexing.embedding_index_planning import VECTOR_SYNC_CHUNK_SIZE
 from basic_memory.indexing.relation_resolution import RelationSearchRefreshResult
+from basic_memory.lifecycle import LIFECYCLE_FIELDS, LIFECYCLE_NUMERIC_FIELDS
+from basic_memory.lifecycle import parse_lifecycle_number as _parse_lifecycle_number
 from basic_memory.models import Entity
 from basic_memory.repository import EntityRepository
 from basic_memory.repository.search_repository import (
@@ -579,6 +581,35 @@ class SearchService:
 
         return []  # pragma: no cover
 
+    def _extract_lifecycle_metadata(self, entity: Entity) -> dict[str, Any]:
+        """Extract lifecycle fields from entity metadata for search indexing.
+
+        Search-time lifecycle treatment (weight sorting, archived hiding) reads
+        weight/canon_status off the search row's metadata, so the indexer carries
+        those frontmatter fields onto each row. Values are whitelisted to
+        JSON-native scalars: a non-serializable frontmatter value (a nested
+        dict, a list, a date) is skipped rather than risked in the index bind.
+
+        Frontmatter parses every scalar to a string, so a note's `weight: 3.0`
+        arrives as "3.0"; the numeric lifecycle fields are converted back to
+        numbers here, so a row carries the number its file states rather than
+        its text.
+        """
+        if not entity.entity_metadata:
+            return {}
+        metadata: dict[str, Any] = {}
+        for key, value in entity.entity_metadata.items():
+            if key not in LIFECYCLE_FIELDS or not isinstance(value, (str, int, float, bool)):
+                continue
+            if key in LIFECYCLE_NUMERIC_FIELDS and not isinstance(value, bool):
+                number = _parse_lifecycle_number(value)
+                if number is None:
+                    continue
+                metadata[key] = number
+                continue
+            metadata[key] = value
+        return metadata
+
     async def index_entity(
         self,
         entity: Entity,
@@ -1074,6 +1105,7 @@ class SearchService:
                 file_path=entity.file_path,
                 metadata={
                     "note_type": normalize_note_type(entity.note_type),
+                    **self._extract_lifecycle_metadata(entity),
                 },
                 created_at=entity.created_at,
                 updated_at=entity.updated_at,
@@ -1154,6 +1186,7 @@ class SearchService:
                 entity_id=entity.id,
                 metadata={
                     "note_type": normalize_note_type(entity.note_type),
+                    **self._extract_lifecycle_metadata(entity),
                 },
                 created_at=entity.created_at,
                 updated_at=entity.updated_at,
@@ -1187,6 +1220,7 @@ class SearchService:
                     entity_id=entity.id,
                     metadata={
                         "tags": obs.tags,
+                        **self._extract_lifecycle_metadata(entity),
                     },
                     created_at=entity.created_at,
                     updated_at=entity.updated_at,
@@ -1216,6 +1250,8 @@ class SearchService:
                     from_id=rel.from_id,
                     to_id=rel.to_id,
                     relation_type=rel.relation_type,
+                    # Relations rank by their source note's lifecycle weight.
+                    metadata=self._extract_lifecycle_metadata(entity),
                     created_at=entity.created_at,
                     updated_at=entity.updated_at,
                     project_id=entity.project_id,

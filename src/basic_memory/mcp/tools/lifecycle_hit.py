@@ -29,8 +29,8 @@ from basic_memory.runtime.storage import runtime_file_path_is_markdown_note
     description=(
         "Record that a note was consulted after bm_search found it. Merges last_hit "
         "and a capped weight bonus into the note's frontmatter through set_metadata; "
-        "notes already at their weight cap still get last_hit refreshed. Requires "
-        "BASIC_MEMORY_LIFECYCLE=1."
+        "the bonus stops at the note's base weight plus half, and a note already at "
+        "its cap still gets last_hit refreshed. Requires BASIC_MEMORY_LIFECYCLE=1."
     ),
     tags={"lifecycle"},
     annotations={
@@ -73,7 +73,8 @@ async def bm_memory_review_hit(
         update = hit_bonus_update(dict(entity.entity_metadata or {}))
         if update is None:
             return (
-                {"ok": False, "message": "note is archived"} if output_format == "json"
+                {"ok": False, "message": "note is archived"}
+                if output_format == "json"
                 else f"{target.paths.path(note.file_path)} is archived; no hit recorded."
             )
         try:

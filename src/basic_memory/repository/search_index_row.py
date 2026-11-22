@@ -183,8 +183,11 @@ class SearchIndexRow:
             "permalink": self.permalink,
             "file_path": self.file_path,
             "type": self.type,
+            # The JSON column takes JSON text or NULL, never a dict: an empty
+            # metadata dict is falsy, so testing it for truthiness would bind the
+            # dict itself and SQLite would reject the parameter type.
             "metadata": json.dumps(self.metadata)
-            if serialize_json and self.metadata
+            if serialize_json and self.metadata is not None
             else self.metadata,
             "from_id": self.from_id,
             "to_id": self.to_id,

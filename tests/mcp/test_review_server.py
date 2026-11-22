@@ -33,7 +33,9 @@ def _workspace_tmp(name: str) -> Path:
 def queue_env(monkeypatch):
     """Point the review queue at a workspace-local file and enable lifecycle."""
     monkeypatch.setenv("BASIC_MEMORY_LIFECYCLE", "1")
-    monkeypatch.setenv("BASIC_MEMORY_REVIEW_QUEUE", str(_workspace_tmp("review-server") / "queue.json"))
+    monkeypatch.setenv(
+        "BASIC_MEMORY_REVIEW_QUEUE", str(_workspace_tmp("review-server") / "queue.json")
+    )
 
 
 def test_review_server_documents_bm_edit_command(queue_env):
@@ -59,30 +61,44 @@ async def test_review_flow_end_to_end(queue_env):
         # propose
         result = await client.call_tool(
             "bm_memory_review_propose",
-            {"proposals": [{
-                "operation": "update",
-                "permalink": "memory://lin",
-                "metadata": {FIELD_WEIGHT: 2.0},
-                "reason": "scene change",
-            }], "output_format": "json"},
+            {
+                "proposals": [
+                    {
+                        "operation": "update",
+                        "permalink": "memory://lin",
+                        "metadata": {FIELD_WEIGHT: 2.0},
+                        "reason": "scene change",
+                    }
+                ],
+                "project": "test-project",
+                "output_format": "json",
+            },
         )
         assert result.structured_content["result"]["queued"] == 1
         proposal_id = result.structured_content["result"]["ids"][0]
 
         # list
-        result = await client.call_tool("bm_memory_review_list", {"output_format": "json"})
+        result = await client.call_tool(
+            "bm_memory_review_list", {"project": "test-project", "output_format": "json"}
+        )
         assert len(result.structured_content["result"]["pending"]) == 1
 
         # decide
         result = await client.call_tool(
             "bm_memory_review_decide",
-            {"proposal_id": proposal_id, "approve": True, "output_format": "json"},
+            {
+                "proposal_id": proposal_id,
+                "approve": True,
+                "project": "test-project",
+                "output_format": "json",
+            },
         )
         assert result.structured_content["result"]["proposal"]["status"] == "approved"
 
         # apply
         result = await client.call_tool(
-            "bm_memory_review_apply", {"proposal_id": proposal_id, "output_format": "json"}
+            "bm_memory_review_apply",
+            {"proposal_id": proposal_id, "project": "test-project", "output_format": "json"},
         )
         assert result.structured_content["result"]["metadata"] == {FIELD_WEIGHT: 2.0}
         assert "bm_edit" in result.structured_content["result"]["next_call"]
@@ -110,12 +126,18 @@ async def test_review_apply_refuses_unapproved(queue_env):
     async with Client(server) as client:
         result = await client.call_tool(
             "bm_memory_review_propose",
-            {"proposals": [{"operation": "archive", "permalink": "memory://x", "reason": "stale"}],
-             "output_format": "json"},
+            {
+                "proposals": [
+                    {"operation": "archive", "permalink": "memory://x", "reason": "stale"}
+                ],
+                "project": "test-project",
+                "output_format": "json",
+            },
         )
         proposal_id = result.structured_content["result"]["ids"][0]
         result = await client.call_tool(
-            "bm_memory_review_apply", {"proposal_id": proposal_id, "output_format": "json"}
+            "bm_memory_review_apply",
+            {"proposal_id": proposal_id, "project": "test-project", "output_format": "json"},
         )
         assert result.structured_content["result"]["ok"] is False
         assert "not approved" in result.structured_content["result"]["message"]

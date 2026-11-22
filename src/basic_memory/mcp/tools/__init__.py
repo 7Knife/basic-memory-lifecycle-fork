@@ -11,6 +11,7 @@ from basic_memory.mcp.tools.delete import bm_delete
 from basic_memory.mcp.tools.edit import bm_edit
 from basic_memory.mcp.tools.find_files import bm_find
 from basic_memory.mcp.tools.listing import bm_list
+from basic_memory.mcp.tools.lifecycle_decay import bm_memory_decay
 from basic_memory.mcp.tools.lifecycle_hit import bm_memory_review_hit
 from basic_memory.mcp.tools.lifecycle_review import (
     bm_memory_review_apply,
@@ -46,6 +47,7 @@ __all__ = [
     "bm_find",
     "bm_list",
     "bm_man",
+    "bm_memory_decay",
     "bm_memory_review_apply",
     "bm_memory_review_decide",
     "bm_memory_review_hit",

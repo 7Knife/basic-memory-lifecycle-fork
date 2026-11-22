@@ -124,12 +124,13 @@ EXPECTED_TOOL_SIGNATURES: dict[str, list[str]] = {
         "output_format",
         "project",
     ],
-    "bm_memory_review_propose": ["proposals", "output_format"],
-    "bm_memory_review_list": ["output_format"],
-    "bm_memory_review_decide": ["proposal_id", "approve", "output_format"],
+    "bm_memory_review_propose": ["proposals", "project", "output_format"],
+    "bm_memory_review_list": ["project", "output_format"],
+    "bm_memory_review_decide": ["proposal_id", "approve", "project", "output_format"],
     "bm_memory_review_hit": ["identifier", "output_format", "project"],
-    "bm_memory_review_apply": ["proposal_id", "output_format"],
-    "bm_memory_review_status": ["output_format"],
+    "bm_memory_decay": ["identifier", "force", "output_format", "project"],
+    "bm_memory_review_apply": ["proposal_id", "project", "output_format"],
+    "bm_memory_review_status": ["project", "output_format"],
 }
 
 
@@ -157,6 +158,7 @@ EXPECTED_TOOL_ANNOTATIONS: dict[str, dict[str, bool]] = {
     "bm_memory_review_list": {"readOnlyHint": True, "destructiveHint": False},
     "bm_memory_review_decide": {"readOnlyHint": False, "destructiveHint": False},
     "bm_memory_review_hit": {"readOnlyHint": False, "destructiveHint": False},
+    "bm_memory_decay": {"readOnlyHint": False, "destructiveHint": False},
     "bm_memory_review_apply": {"readOnlyHint": True, "destructiveHint": False},
     "bm_memory_review_status": {"readOnlyHint": True, "destructiveHint": False},
 }
@@ -199,6 +201,7 @@ TOOL_FUNCTIONS: dict[str, object] = {
     "bm_memory_review_list": tools.bm_memory_review_list,
     "bm_memory_review_decide": tools.bm_memory_review_decide,
     "bm_memory_review_hit": tools.bm_memory_review_hit,
+    "bm_memory_decay": tools.bm_memory_decay,
     "bm_memory_review_apply": tools.bm_memory_review_apply,
     "bm_memory_review_status": tools.bm_memory_review_status,
 }

@@ -223,9 +223,8 @@ async def test_after_date_uses_updated_at(search_service):
 
     project_id = search_service.repository.project_id
 
-    # Leave metadata at its None default — SearchIndexRow.to_insert only
-    # JSON-serializes truthy metadata, so passing {} would slip an
-    # un-serialized dict into the SQLite bind and raise ProgrammingError.
+    # Leave metadata at its None default — a row's metadata is optional, and
+    # None means the row carries none.
     recently_updated_row = SearchIndexRow(
         project_id=project_id,
         id=99001,
@@ -1926,3 +1925,168 @@ async def test_reindex_vectors_is_a_noop_when_the_vector_runtime_is_unavailable(
     assert stats["embedded"] == 0
     assert stats["errors"] == 0
     assert stats["skipped"] == stats["total_entities"] >= 1
+
+
+# --- Lifecycle metadata on search rows ---
+
+
+async def _create_lifecycle_entity(
+    session_maker, entity_repo, test_project, entity_metadata, permalink="test/lifecycle-note"
+):
+    """Create one entity carrying the given frontmatter metadata."""
+    from basic_memory.models.knowledge import Entity
+
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        session.add(
+            Entity(
+                project_id=test_project.id,
+                title="Lifecycle Note",
+                note_type="note",
+                permalink=permalink,
+                file_path=f"test/{permalink.split('/')[-1]}.md",
+                content_type="text/markdown",
+                entity_metadata=entity_metadata,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.flush()
+    async with db.scoped_session(session_maker) as session:
+        return await entity_repo.get_by_permalink(session, permalink)
+
+
+@pytest.mark.asyncio
+async def test_index_entity_markdown_carries_lifecycle_metadata(
+    search_service, entity_repository, session_maker, test_project
+):
+    """Lifecycle frontmatter travels onto the entity search row's metadata.
+
+    The lifecycle payload treatment reads weight/canon_status off the search row,
+    so the indexer must write them; non-lifecycle keys stay out.
+    """
+    entity = await _create_lifecycle_entity(
+        session_maker,
+        entity_repository,
+        test_project,
+        {
+            "weight": 2.5,
+            "base_weight": 2.5,
+            "canon_status": "canon",
+            "nonsense": "keep out",
+        },
+    )
+    assert entity is not None
+
+    await search_service.index_entity_markdown(entity, content="Lifecycle body.")
+
+    results = await search_service.search(SearchQuery(permalink="test/lifecycle-note"))
+    assert len(results) == 1
+    row = results[0]
+    assert row.type == SearchItemType.ENTITY.value
+    assert row.metadata["weight"] == 2.5
+    assert row.metadata["base_weight"] == 2.5
+    assert row.metadata["canon_status"] == "canon"
+    assert "nonsense" not in row.metadata
+
+
+@pytest.mark.asyncio
+async def test_index_entity_file_carries_lifecycle_metadata(
+    search_service, entity_repository, session_maker, test_project
+):
+    """The content-free index path carries lifecycle metadata too."""
+    entity = await _create_lifecycle_entity(
+        session_maker,
+        entity_repository,
+        test_project,
+        {"weight": 1.5, "canon_status": "draft"},
+    )
+    assert entity is not None
+
+    await search_service.index_entity_file(entity)
+
+    results = await search_service.search(SearchQuery(permalink="test/lifecycle-note"))
+    assert len(results) == 1
+    assert results[0].metadata["weight"] == 1.5
+    assert results[0].metadata["canon_status"] == "draft"
+
+
+@pytest.mark.asyncio
+async def test_index_observation_and_relation_rows_inherit_parent_lifecycle_metadata(
+    search_service, entity_repository, session_maker, test_project
+):
+    """Observation and relation hits rank by their parent note's lifecycle weight."""
+    from basic_memory.models.knowledge import Entity, Observation, Relation
+
+    now = datetime.now(timezone.utc)
+    async with db.scoped_session(session_maker) as session:
+        entity = Entity(
+            project_id=test_project.id,
+            title="Lifecycle Parent",
+            note_type="note",
+            permalink="test/lifecycle-parent",
+            file_path="test/lifecycle_parent.md",
+            content_type="text/markdown",
+            entity_metadata={"weight": 3.0, "canon_status": "canon"},
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(entity)
+        await session.flush()
+        session.add(
+            Observation(
+                project_id=test_project.id,
+                entity_id=entity.id,
+                category="fact",
+                content="observed",
+            )
+        )
+        session.add(
+            Relation(
+                project_id=test_project.id,
+                from_id=entity.id,
+                to_id=None,
+                to_name="somewhere",
+                relation_type="links",
+            )
+        )
+        await session.flush()
+
+    async with db.scoped_session(session_maker) as session:
+        entity = await entity_repository.get_by_permalink(session, "test/lifecycle-parent")
+    assert entity is not None
+
+    await search_service.index_entity_markdown(entity, content="Parent body.")
+
+    # Observation and relation rows carry derived permalinks
+    # ("<entity>/observations/<id>", "<entity>/<type>/<target>"), so the exact
+    # entity permalink does not match them; the pattern does.
+    results = await search_service.search(SearchQuery(permalink_match="test/lifecycle-parent*"))
+    rows_by_type = {row.type: row for row in results}
+    assert SearchItemType.OBSERVATION.value in rows_by_type
+    assert SearchItemType.RELATION.value in rows_by_type
+    assert rows_by_type[SearchItemType.OBSERVATION.value].metadata["weight"] == 3.0
+    assert rows_by_type[SearchItemType.RELATION.value].metadata["weight"] == 3.0
+    assert rows_by_type[SearchItemType.RELATION.value].metadata["canon_status"] == "canon"
+
+
+@pytest.mark.asyncio
+async def test_index_skips_non_scalar_lifecycle_values(
+    search_service, entity_repository, session_maker, test_project
+):
+    """A non-JSON-native lifecycle value is dropped, not risked in the index bind."""
+    entity = await _create_lifecycle_entity(
+        session_maker,
+        entity_repository,
+        test_project,
+        {"weight": {"nested": "dict"}, "canon_status": "canon"},
+    )
+    assert entity is not None
+
+    await search_service.index_entity_markdown(entity, content="Lifecycle body.")
+
+    results = await search_service.search(SearchQuery(permalink="test/lifecycle-note"))
+    assert len(results) == 1
+    # The un-serializable weight is skipped; the scalar status survives.
+    assert "weight" not in results[0].metadata
+    assert results[0].metadata["canon_status"] == "canon"

@@ -48,7 +48,9 @@ def test_decay_is_idempotent_within_interval():
 
 
 def test_decay_archives_below_threshold():
-    update = decay_update(_meta(weight=1.2, base_weight=1.5, last_hit="2026-01-01T00:00:00Z"), now=NOW)
+    update = decay_update(
+        _meta(weight=1.2, base_weight=1.5, last_hit="2026-01-01T00:00:00Z"), now=NOW
+    )
     assert update is not None
     assert update[FIELD_CANON_STATUS] == CANON_ARCHIVED
     assert "archived_at" in update
@@ -73,18 +75,34 @@ def _workspace_tmp(name: str) -> Path:
 def test_review_queue_lifecycle(monkeypatch):
     tmp_path = _workspace_tmp("queue")
     monkeypatch.setenv("BASIC_MEMORY_REVIEW_QUEUE", str(tmp_path / "queue.json"))
-    q = ReviewQueue()
-    added = q.propose([{
-        "operation": "update", "permalink": "memory://lin",
-        "metadata": {FIELD_WEIGHT: 2.0},
-        "reason": "scene change",
-        "evidence": [{"source": "ch1", "quote": "..."}],
-    }])
+    q = ReviewQueue(project="test-project")
+    added = q.propose(
+        [
+            {
+                "operation": "update",
+                "permalink": "memory://lin",
+                "metadata": {FIELD_WEIGHT: 2.0},
+                "reason": "scene change",
+                "evidence": [{"source": "ch1", "quote": "..."}],
+            }
+        ]
+    )
     assert len(added) == 1
-    assert len(q.propose([{
-        "operation": "update", "permalink": "memory://lin",
-        "metadata": {FIELD_WEIGHT: 2.0}, "reason": "scene change",
-    }])) == 0
+    assert (
+        len(
+            q.propose(
+                [
+                    {
+                        "operation": "update",
+                        "permalink": "memory://lin",
+                        "metadata": {FIELD_WEIGHT: 2.0},
+                        "reason": "scene change",
+                    }
+                ]
+            )
+        )
+        == 0
+    )
     assert q.list_pending()[0].hits == 2
     q.decide(added[0].id, False)
     assert q.list_pending() == []
@@ -94,21 +112,36 @@ def test_apply_patch_filters_to_lifecycle_fields(monkeypatch):
     tmp_path = _workspace_tmp("patch")
     monkeypatch.setenv("BASIC_MEMORY_REVIEW_QUEUE", str(tmp_path / "queue.json"))
     q = ReviewQueue()
-    added = q.propose([{
-        "operation": "status_progression", "permalink": "memory://lin",
-        "metadata": {FIELD_CANON_STATUS: CANON_CANON, "tags": ["x"]},
-        "reason": "confirmed",
-    }])[0]
+    added = q.propose(
+        [
+            {
+                "operation": "status_progression",
+                "permalink": "memory://lin",
+                "metadata": {FIELD_CANON_STATUS: CANON_CANON, "tags": ["x"]},
+                "reason": "confirmed",
+            }
+        ]
+    )[0]
     patch = ReviewQueue.applies_to_metadata(added)
     assert patch == {FIELD_CANON_STATUS: CANON_CANON}
 
 
 def test_search_payload_weight_sort(monkeypatch):
     monkeypatch.setenv("BASIC_MEMORY_LIFECYCLE", "1")
-    payload = {"results": [
-        {"file_path": "archived.md", "score": 0.9, "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_ARCHIVED}},
-        {"file_path": "canon.md", "score": 0.7, "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_CANON}},
-    ]}
+    payload = {
+        "results": [
+            {
+                "file_path": "archived.md",
+                "score": 0.9,
+                "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_ARCHIVED},
+            },
+            {
+                "file_path": "canon.md",
+                "score": 0.7,
+                "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_CANON},
+            },
+        ]
+    }
     out = _apply_lifecycle_to_payload(payload, sort_by="weight", include_archived=False)
     assert len(out["results"]) == 1
     assert out["results"][0]["score"] == pytest.approx(0.7)
@@ -117,10 +150,21 @@ def test_search_payload_weight_sort(monkeypatch):
 
 def test_search_payload_weight_sort_reorders_results(monkeypatch):
     monkeypatch.setenv("BASIC_MEMORY_LIFECYCLE", "1")
-    payload = {"total": 2, "results": [
-        {"file_path": "low.md", "score": 0.9, "metadata": {FIELD_WEIGHT: 1, FIELD_CANON_STATUS: CANON_CANON}},
-        {"file_path": "high.md", "score": 0.7, "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_CANON}},
-    ]}
+    payload = {
+        "total": 2,
+        "results": [
+            {
+                "file_path": "low.md",
+                "score": 0.9,
+                "metadata": {FIELD_WEIGHT: 1, FIELD_CANON_STATUS: CANON_CANON},
+            },
+            {
+                "file_path": "high.md",
+                "score": 0.7,
+                "metadata": {FIELD_WEIGHT: 3, FIELD_CANON_STATUS: CANON_CANON},
+            },
+        ],
+    }
     out = _apply_lifecycle_to_payload(payload, sort_by="weight", include_archived=True)
     assert [r["file_path"] for r in out["results"]] == ["high.md", "low.md"]
     assert out["results"][0]["score"] > out["results"][1]["score"]

@@ -30,6 +30,7 @@ V1_TOOLS = {
     "bm_memory_review_list",
     "bm_memory_review_decide",
     "bm_memory_review_hit",
+    "bm_memory_decay",
     "bm_memory_review_apply",
     "bm_memory_review_status",
 }

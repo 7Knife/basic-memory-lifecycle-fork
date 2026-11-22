@@ -601,6 +601,47 @@ async def test_to_insert_includes_project_id(search_repository):
     assert insert_data["project_id"] == search_repository.project_id
 
 
+def test_to_insert_serializes_empty_metadata():
+    """An empty metadata dict is serialized, not bound raw.
+
+    The metadata column holds JSON text, so a dict passed through unbound
+    would reach SQLite as a dict parameter and fail to bind.
+    """
+    row = SearchIndexRow(
+        id=1235,
+        type=SearchItemType.RELATION.value,
+        title="Relation",
+        permalink="test/links/target",
+        file_path="test/file.md",
+        metadata={},
+        project_id=1,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    insert_data = row.to_insert()
+
+    assert insert_data["metadata"] == "{}"
+
+
+def test_to_insert_keeps_missing_metadata_null():
+    """A row with no metadata at all stores NULL, not an empty JSON object."""
+    row = SearchIndexRow(
+        id=1236,
+        type=SearchItemType.ENTITY.value,
+        title="Note",
+        permalink="test/note",
+        file_path="test/file.md",
+        project_id=1,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    insert_data = row.to_insert()
+
+    assert insert_data["metadata"] is None
+
+
 def test_directory_property():
     """Test the directory property of SearchIndexRow."""
     # Test a file in a nested directory
